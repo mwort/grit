@@ -1,0 +1,297 @@
+import os
+from pathlib import Path as P
+import pandas as pd
+
+from snakemake_utils import conda_envs
+
+# a shortcut to make paths absolute from the snakefile
+here = lambda p: str(workflow.current_basedir.join(p))
+
+configfile: here("GRIT_config.yml")
+
+localrules: domain_grass_regions
+
+
+DOMAINS_TBL = pd.read_csv(here(config["domains_selected"]), index_col=0, keep_default_na=False)
+
+#DOMAINS_TBL = DOMAINS_TBL[DOMAINS_TBL.region_code == "AS"]
+#waiting_domains = "DANU".split()
+#DOMAINS_TBL.drop(waiting_domains, inplace=True)
+
+DOMAIN_IDS = list(DOMAINS_TBL.index)
+DOMAIN_REGIONS = DOMAINS_TBL.groupby("region_code").groups
+#print(f"!!!!\nRead {len(DOMAIN_IDS)} domain ids.\n!!!")
+
+DATA = P(os.environ["PROJECT_ROOT"])/"data"
+
+
+def mapset(n, lonlat=False):
+    loc = "GRASS/{dom}"+('_lonlat' if lonlat else '')
+    return directory(loc.format(dom="{domain,\w{4}}") + "/" + n)
+
+def mapsets(n, lonlat=False, **kw):
+    kw.setdefault("domain", ["{domain}"])
+    loc = "GRASS/{domain}"+('_lonlat' if lonlat else '')
+    m = expand(loc + "/" + n, **kw)
+    return directory(m)
+
+def intermediate_output(*path):
+    return os.path.join(config["intermediate_output_dir"], *path)
+
+
+localrules: domains_table
+
+# convenience conversion of input domains gpkg, not actually used
+rule domains_table:
+    input: here(config["domains"])
+    output: "input/domains.csv"
+    conda: conda_envs.geopandas
+    shell:
+        "geopandas_utils.py geo_to_csv {input} {output}"
+
+
+rule domain_location:
+    input:
+        ancient(here(config["domains"])),
+        ancient(here("input/domains_selected.csv"))  # domains selected created by hand from DOMAINS
+    output:
+        mapset("PERMANENT"),
+        intermediate_output("domain_grass_regions/{domain}.txt")
+    resources:
+        time=5
+    params:
+        domain_cat = lambda wc, input: pd.read_csv(input[1], index_col=0).loc[wc.domain, "cat"]
+    shell:
+        """
+        rm -r $(dirname {output[0]})
+        grass -c {input[0]} $(dirname {output[0]}) --exec \
+            v.in.ogr {input[0]} out=domain where="cat={params.domain_cat}"
+        grass {output[0]} --exec g.region -ags res=30 grow=1000 vect=domain > {output[1]}
+        grass {output[0]} --exec v.in.region out=ROI
+        """
+
+
+rule domain_location_lonlat:
+    input: rules.domain_location.output[0]
+    output: mapset("PERMANENT", lonlat=True)
+    resources:
+        time=5
+    shell:
+        """
+        rm -r $(dirname {output})
+        grass -e -c EPSG:4326 $(dirname {output})
+        grass {output} --exec v.proj in=domain loc={wildcards.domain} map=PERMANENT
+        grass {output} --exec g.region -psa res=1 vect=domain
+        """
+
+rule domain_grass_regions:
+    input: ancient(expand(rules.domain_location.output[1], domain=DOMAIN_IDS))
+    output: intermediate_output("domain_grass_regions.csv")
+    run:
+        dat=dict()
+        for i in input:
+            n = osp.basename(osp.splitext(i)[0])
+            dat[n] = pd.read_csv(i, sep="=", header=None, index_col=0).iloc[:, 0]
+        pd.DataFrame(dat).drop(["projection", "zone"]).T.to_csv(output[0])
+
+def region_depending(function, default):
+    """A factory function to read the domain file and pick out the domain, return default
+    if the region file doesnt exist.
+    """
+    def factory(wc):
+        if osp.exists(rules.domain_grass_regions.output[0]):
+            region = pd.read_csv(rules.domain_grass_regions.output[0], index_col=0).loc[wc.domain]
+            return function(region)
+        else:
+            return default
+    return factory
+
+
+tile_file = intermediate_output('grwl_tiles/{domain}.txt')
+checkpoint grwl_tiles:
+    input: DATA/"GRWL_Allen_Pavelsky"/"GRASS/lonlat/tiles", rules.domain_location.output[0]
+    output: tile_file, mapset("grwl_tiles")
+    resources:
+        time=10
+    shell:
+        """
+        grass -c {output[1]} --exec v.proj out=tiles dbase=$(dirname $(dirname {input[0]})) \
+            loc=$(basename $(dirname {input[0]})) mapset=$(basename {input[0]}) in=all_tiles
+        grass {output[1]} --exec v.select ain=tiles bin=domain@PERMANENT out=tiles_selected
+        grass {output[1]} --exec v.db.select -c tiles_selected col=TILE_ID > {output[0]}
+        """
+
+def get_tiles(wc):
+    tf = P(tile_file.format(domain=wc.domain))
+    if tf.exists():
+        tls = [s.strip() for s in open(tf).readlines()]
+        return mapsets("tmp_grwl_{t}", t=tls)
+    else:
+        return tf
+
+rule grwl_patch:
+    input:
+        tile_file=tile_file,
+        tiles=get_tiles,
+        patches=ancient(directory(config["grwl_patches_dir"]))
+    output: mapset("grwl")
+    params:
+        rasters=lambda wc, input: ','.join([i.split('_')[-1]+"@"+osp.basename(i) for i in input.tiles])
+    shell:
+        """
+        input={params.rasters}
+        grass -c {output} -e
+        if [ -f {input.patches}/{wildcards.domain}.tif ]; then
+            # assuming patches are in EPSG8857
+            grass {output} --exec r.import -o in={input.patches}/{wildcards.domain}.tif out=patch
+            input=patch,$input
+        fi
+        if (( $(echo $input | tr ',' ' ' | wc -w) > 1 )) ; then
+            grass {output} --exec r.patch in=$input out=grwl mem=7000
+        else
+            grass {output} --exec g.copy rast=$input,grwl
+        fi
+        """
+
+
+rule proj_GRWL:
+    input:
+        DATA/"GRWL_Allen_Pavelsky"/"GRASS/UTM_{NS}{number}/{NS}{L}{number}",
+        DATA/"GRWL_Allen_Pavelsky"/"GRASS/UTM_{NS}{number}/PERMANENT",
+        rules.domain_location.output[0]
+    output: temp(mapset("tmp_grwl_{NS,.}{L,.}{number}"))
+    resources:
+        time=120
+    threads: 2
+    shadow: "minimal"
+    shell:
+        """grass -c {output} --exec r.proj -n loc=$(basename $(dirname {input[0]})) map=$(basename {input[0]}) \
+            dbase=$(dirname $(dirname {input[0]})) input=$(basename {input[0]}) memory=$(({threads}*7000)) res=30
+        """
+
+rule fabdem_mosaic:
+    input:
+        DATA/"FABDEM_Hawker_etal/GRASS/lonlat/tiles",
+        DATA/"FABDEM_Hawker_etal/FABDEM_V1-0",
+        rules.domain_location.output[0],
+        rules.domain_location_lonlat.output
+    output: mapset("fabdem_tiles"), intermediate_output('fabdem_tiles/{domain}.vrt'), mapset("fabdem", lonlat=True)
+    resources:
+        time=60
+    shell:
+        """
+        grass -c {output[0]} --exec v.proj out=tiles dbase=$(dirname $(dirname {input[0]})) loc=$(basename $(dirname {input[0]})) \
+            mapset=$(basename {input[0]}) in=fabdem_tiles
+        grass {output[0]} --exec v.select ain=tiles bin=ROI@PERMANENT out=tiles_selected
+        gdalbuildvrt {output[1]} $(grass {output[0]} --exec v.db.select -c tiles_selected col=file | sed -e 's+^+{input[1]}/+;')
+        grass -c {output[2]} --exec r.external -r in={output[1]} out=fabdem
+        """
+
+rule fabdem_import:
+    input: rules.fabdem_mosaic.output, rules.domain_location.output[0], rules.domain_location_lonlat.output
+    output: mapset("fabdem")
+    threads: 8
+    shadow: "minimal"
+    resources:
+        time="12:00:00"
+    shell:
+        """
+        grass -c {output[0]} --exec r.proj -n loc=$(basename $(dirname {input[2]})) map=$(basename {input[2]}) \
+            input=fabdem memory=$((7000*{threads})) res=30 method=bilinear_f
+        """
+
+#!!! cant be run in all in parallel as it somehow leads to a tmpdir overflow, best to submit as single job with 12-16 CPUs (3-4 concurrent tasks)
+rule osm_water:
+    input: DATA/'OSM_water_Yamazaki_etal/OSM_WaterLayer.pbf', rules.domain_location_lonlat.output
+    output: mapset("osm_water", lonlat=True)
+    threads: 12  # to avoid too many running on the same node
+    resources:
+        time="4:00:00"
+    shell:
+        """
+        grass -e -c {output}  # might avoid errors in subsequent v.in.ogr
+        grass {output} --exec v.in.ogr -r in={input[0]} layer=lines out=osm_water_lines type=line where="waterway='river' OR waterway='canal'"
+        #grass {output} --exec v.in.ogr -r in={input[0]} layer=multilinestrings out=osm_water_multilines type=line
+        grass {output} --exec v.in.ogr -r in={input[0]} layer=lines out=osm_water_lines_small type=line where="waterway is not NULL AND waterway!='river' AND waterway!='canal'"
+        grass {output} --exec v.in.ogr -r in={input[0]} layer=multipolygons out=osm_water_polygons min_area=$((3*30*30)) snap=0.0005
+        # double check if lines have actually been imported
+        nlines=$(grass {output} --exec v.info osm_water_lines -t | grep "lines=" | cut -d"=" -f2)
+        echo osm_water_lines has $nlines lines
+        if (( $nlines == 0 )); then echo I dont think importing osm_water_lines worked; exit 1; fi
+        """
+
+rule osm_water_reproj:
+    input: rules.osm_water.output
+    output: mapset("osm_water")
+    shell:
+        """
+        grass -c {output} --exec v.proj loc=$(basename $(dirname {input})) map=$(basename {input}) in=osm_water_polygons
+        grass {output} --exec v.proj loc=$(basename $(dirname {input})) map=$(basename {input}) in=osm_water_lines
+        grass {output} --exec v.proj loc=$(basename $(dirname {input})) map=$(basename {input}) in=osm_water_lines_small
+        """
+
+rule osm_water_grwl:
+    input: rules.osm_water_reproj.output, rules.domain_location.output[0]
+    output: mapset("osm_water_grwl")
+    shadow: "minimal"
+    threads: 2
+    shell:
+        """
+        grass -c {output} --exec osm_data.py make_grwl_raster osm_water_lines@$(basename {input}) osm_grwl_lines --default=255
+        grass {output} --exec osm_data.py make_grwl_raster osm_water_lines_small@$(basename {input}) osm_grwl_lines_small --default=255
+        grass {output} --exec osm_data.py make_grwl_raster osm_water_polygons@$(basename {input}) osm_grwl_polygons
+        """
+
+
+rule osm_oceans_seas_land:
+    input:
+        DATA/"OSM_oceans_seas_land"/"water-polygons-split-4326/water_polygons.shp",
+        DATA/"OSM_oceans_seas_land"/"land-polygons-split-4326/land_polygons.shp",
+        rules.domain_location.output[0]
+    output: mapset("osm_oceans_seas_land")
+    resources:
+        time=60
+    shell:
+        """
+        #grass -c {output} --exec v.import in={input[0]} out=osm_oceans_seas extent=region snap=0.0001
+        grass -c {output} --exec v.import in={input[1]} out=osm_land extent=region snap=0.0001
+        """
+
+
+rule hydrobasins_order_1:
+    input: DATA/"HydroBASINS"/"order_1_merged.gpkg", rules.domain_location.output[0]
+    output: mapset("hydrobasins")
+    shell:
+        """
+        grass -c {output} --exec v.import in={input[0]} out=hydrobasins_order_1 extent=region ; 
+        """
+
+
+rule glwd:
+    input: DATA/"GLWD"/"GLWD_level1/glwd_1.shp", rules.domain_location.output[0]
+    output: mapset("glwd")
+    shell:
+        """
+        grass -c {output} --exec v.import in={input[0]} out=glwd_level_1 extent=region ;
+        # too large/outdated lakes
+        if [ -d {output}/vector/glwd_level_1 ]; then
+            grass {output} --exec v.edit map=glwd_level_1 tool=delete where="LAKE_NAME in \
+                ('Caspian Sea', 'Aral Sea', 'Kisale', 'Cayuga Lake', 'Alaotra', 'Ziway', 'Jackson Lake', \
+                 'Yang-Cho-Yung', 'Salada', 'Na')"
+            # domains: IND0 MISS JUBB CONG HUDS YANG GANG NOR2
+        else
+            grass {output} --exec mfp_river_network.grass.sh create_empty_vector glwd_level_1
+        fi
+        """
+
+
+rule gswe:
+    input: DATA/"GSWE_Pekal_etal/Aggregated/VER4-0/occurrence"
+    output: mapset("gswe"), intermediate_output("gswe_mosaic/{domain}.vrt")
+    shell:
+        """
+        grass -c {output[0]} --exec v.import {input}/tile_index.gpkg out=tiles extent=region
+        grass {output[0]} --exec v.select ain=tiles bin=domain@PERMANENT out=tiles_selected
+        gdalbuildvrt {output[1]} $(grass {output[0]} --exec v.db.select tiles_selected col=location -c | sed 's:.*:{input}/&:')
+        grass {output[0]} --exec r.import --v in={output[1]} ext=region resolution=region mem=7000 out=occurrence
+        """

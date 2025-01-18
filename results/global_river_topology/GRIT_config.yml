@@ -1,0 +1,38 @@
+# GRIT configuration, including input and output paths
+
+version: v06
+
+
+# input
+domains: 'input/domains.gpkg'
+domains_selected: "input/domains_selected.csv"
+predictors_info: "../bankfull_ML_estimates/predictors.csv"
+diagnostics_commands: "input/diagnostics.csv"
+grwl_patches_dir: "input/grwl_patches"
+osm_land_patches_dir: "input/osm_land_patches"
+rivgraph_fixes: "input/rivgraph_fixlinks"
+
+# output
+output_projection_epsg: [8857, 4326, 3857]
+intermediate_output_dir: 'intermediate_output'
+line_node_vectors:
+  - segments
+  - segments_simple
+  - reaches
+  - reaches_simple
+
+raster_output_patch_tile_method:
+  flow_accumulation:
+    drainage_area: nanmax
+  hand:
+    hand: nanmin
+  extent_coastal:
+    rivers_grwl: nanmax
+
+## upload to servers
+mw_server_upload: false
+zenodo_upload: false
+zenodo_bucket_url: "https://zenodo.org/api/files/335b4458-85cf-44e1-b270-f26da0d217b1"
+zenodo_token: "$(cat ~/Zenodo_access_token)"  # read-protected token
+zenodo_projection_epsg: [8857, 4326]
+

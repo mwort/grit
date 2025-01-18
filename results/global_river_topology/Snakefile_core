@@ -1,0 +1,570 @@
+import os.path as osp
+from pathlib import Path as P
+import numpy as np
+import pandas as pd
+
+from snakemake_utils import conda_envs
+
+configfile: "GRIT_config.yml"
+
+include: "Snakefile_input_data"
+
+DEM_MAPSET = mapset("fabdem")
+DEM_RASTER = "fabdem@fabdem"
+
+
+rule land_ocean_coast:
+    input:
+        rules.osm_oceans_seas_land.output,
+        ancient(directory(config["osm_land_patches_dir"])),
+        rules.domain_location.output[0]
+    output: mapset("land_ocean_coast")
+    shadow: "minimal"
+    shell:
+        """
+        grass -c {output} -e
+        input_vect=osm_land@$(basename {input[0]})
+        if [ -f {input[1]}/{wildcards.domain}.gpkg ]; then
+            grass {output} --exec v.import in={input[1]}/{wildcards.domain}.gpkg out=patch
+            grass {output} --exec v.overlay -t ain=$input_vect bin=patch op=or out=osm_land_patched
+            input_vect=osm_land_patched
+        fi
+        grass {output} --exec mfp_river_network.grass.sh land_ocean_coast \
+            $input_vect $(basename {output})
+        """
+
+rule patch_grwl_gaps:
+    input:
+        rules.gswe.output[0],
+        rules.grwl_patch.output,
+        rules.land_ocean_coast.output,
+        rules.glwd.output,
+        rules.grwl_tiles.output[1],
+        rules.domain_location.output[0]
+    output: mapset("patch_grwl_gaps")
+    shadow: "minimal"
+    shell:
+        """
+        grass -c {output} --exec mfp_river_network.grass.sh patch_coastal_grwl occurrence@$(basename {input[0]}) \
+            grwl@$(basename {input[1]}) land@$(basename {input[2]}) $(basename {output})
+        grass {output} --exec mfp_river_network.grass.sh patch_large_grwl_lakes glwd_level_1@$(basename {input[3]}) \
+            tiles_selected@$(basename {input[4]}) grwl@$(basename {input[1]}) $(basename {output})
+        grass {output} --exec r.patch in=grwl@$(basename {input[1]}),grwl_large_lake_gap,coastal_water out=grwl_patched
+        """
+
+
+rule river_mask_filling:
+    input: rules.patch_grwl_gaps.output, rules.domain_location.output[0]
+    output: mapset("river_mask_filling")
+    shadow: "minimal"
+    shell:
+        """
+        grass -c {output} --exec mfp_river_network.grass.sh river_mask_filling \
+            grwl_patched@$(basename {input[0]}) $(basename {output})
+        """
+
+rule extent_coastal:
+    input: rules.river_mask_filling.output, rules.land_ocean_coast.output, rules.domain_location.output[0]
+    output: mapset("extent_coastal")
+    shadow: "minimal"
+    shell:
+        """
+        grass -c {output} --exec mfp_river_network.grass.sh extent_coastal \
+            rivers_filled@$(basename {input[0]}) land@$(basename {input[1]}) \
+            coast_distance@$(basename {input[1]}) $(basename {output})
+        """
+
+rule grwl_bank_distance:
+    input: rules.extent_coastal.output, rules.domain_location.output[0]
+    output: mapset("grwl_bank_distance")
+    shadow: "minimal"
+    shell:
+        """
+        grass -c {output} --exec r.grow.distance -n input=rivers_grwl@$(basename {input}) distance=bank_distance
+        grass {output} --exec r.mapcalc --o exp="bank_distance=if(isnull(rivers_grwl@$(basename {input})), null(), bank_distance)"
+        """
+
+
+rule grwl_lakes:
+    input:
+        rules.extent_coastal.output,
+        rules.grwl_bank_distance.output,
+        rules.domain_location.output[0]
+    output: mapset("grwl_lakes")
+    shadow: "minimal"
+    shell:
+        """
+        grass -c {output} --exec thin_large_lakes.grass.sh identify_large_lakes \
+            rivers_grwl@$(basename {input[0]}) bank_distance@$(basename {input[1]}) $(basename {output})
+        """
+
+rule skeletonise:
+    input:
+        rules.extent_coastal.output,
+        rules.grwl_lakes.output,
+        ancient(rules.domain_grass_regions.output),
+        rules.domain_location.output[0]
+    output: mapset("skeletonise")
+    threads: region_depending(lambda r: int(r["cells"]/(4e8)) + 1, 1)
+    conda: conda_envs.rivgraph   # for skimage to thin large lakes
+    shadow: "minimal"
+    shell:
+        """
+	    grwl=rivers_grwl@$(basename {input[0]})
+        nlargelakes=$(grass {input[1]} --exec v.db.select -c large_lakes@$(basename {input[1]}) col=cat | wc -l)
+        echo !!! Found $nlargelakes large lakes !!!
+        grass -e -c {output}
+        if (($nlargelakes > 0)); then
+            if [[ ! -z $(grass {input[1]} --exec v.db.select -c tile_lines_clipped) ]] ; then
+                grwl=rivers_grwl_patched@$(basename {input[1]})
+            fi
+            grass {output} --exec thin_large_lakes.grass.sh create_mapsets large_lakes@$(basename {input[1]}) $(basename {output})
+            msets=$(cd $(dirname {output}) && ls -d $(basename {output})__large__lake__*)
+            printf "%s\\n" $msets | xargs -i"<ms>" -n 1 -P {threads} echo "<ms>"
+            printf "%s\\n" $msets | xargs -i"<ms>" -n 1 -P {threads} grass $(dirname {output})/"<ms>" --exec \
+                thin_large_lakes.grass.sh thin_skimage $grwl large__lake__thin
+            grass {output} --exec thin_large_lakes.grass.sh patch_thinned $grwl \
+                large_lakes@$(basename {input[1]}) $(printf "large__lake__thin@%s\\n" $msets | paste -sd, -) grwl__no_large_lakes
+            grwl=grwl__no_large_lakes
+        fi
+        grass {output} --exec mfp_river_network.grass.sh skeletonise_parallel \
+            $grwl {threads} $(basename {output})
+        """
+
+
+rule vectorize:
+    input:
+        rules.grwl_bank_distance.output,
+        rules.skeletonise.output,
+        rules.land_ocean_coast.output,
+        rules.domain_location.output[0]
+    output: mapset("vectorize")
+    threads: 2
+    shadow: "minimal"
+    shell:
+        """
+        grass -c {output} --exec r.mask land@$(basename {input[2]}) 
+        grass {output} --exec mfp_river_network.grass.sh vectorize rivers_thinned@$(basename {input[1]}) \
+            bank_distance@$(basename {input[0]}) coast@$(basename {input[2]}) $(basename {output})
+        """
+
+
+rule interbasin_nodes:
+    input:
+        rules.vectorize.output,
+        DEM_MAPSET,
+        rules.domain_location.output[0],
+        rules.land_ocean_coast.output
+    output:  mapset("interbasin_nodes")
+    params: dem=DEM_RASTER
+    shell:
+        """
+        if [ -d {input[2]}/vector/domain ] ; then
+            grass -c {output} --exec mfp_river_network.grass.sh interbasin_nodes domain@$(basename {input[2]}) \
+                rivers_cleaned@$(basename {input[0]}) {params.dem} coast_distance@$(basename {input[3]}) $(basename {output})
+        else
+            grass -c {output} --exec mfp_river_network.grass.sh create_empty_vector interbasin_nodes
+        fi
+        """
+
+
+rule depressionless_dem:
+    input: DEM_MAPSET, rules.domain_location.output[0]
+    output: mapset("depressionless_dem")
+    shadow: "minimal"
+    threads: region_depending(lambda r: max(min(int(r["cells"]/2e8), 48), 4), 1)  # btw 4 - 48 cpus
+    params: dem=DEM_RASTER
+    shell:
+        """
+        grass -c {output} --exec g.copy rast={params.dem},dem__
+        grass {output} --exec r.hydrodem -fa in=dem__ out=depressionless_dem mem=$((7500*{threads}-1000))
+        grass {output} --exec r.mapcalc exp="depression_diff=depressionless_dem-dem__"
+        grass {output} --exec g.remove rast name=dem__ -f
+        """
+
+
+rule dem_conditioning:
+    input:
+        rules.grwl_bank_distance.output,
+        rules.vectorize.output,
+        rules.osm_water_grwl.output,
+        rules.land_ocean_coast.output,
+        rules.extent_coastal.output,
+        rules.domain_location.output[0]
+    output: mapset("dem_conditioning")
+    shadow: "minimal"
+    shell:
+        """
+        grass -c {output} --exec r.mask land@$(basename {input[3]}) 
+        grass {output} --exec mfp_river_network.grass.sh dem_conditioning \
+            bank_distance@$(basename {input[0]}) \
+            rivers_cleaned@$(basename {input[1]}) osm_grwl_lines@$(basename {input[2]}) osm_grwl_lines_small@$(basename {input[2]}) \
+            rivers_grwl@$(basename {input[4]}) $(basename {output})
+        """
+
+rule sinks:
+    input:
+        DEM_MAPSET,
+        rules.extent_coastal.output,
+        rules.grwl_lakes.output,
+        rules.glwd.output,
+        rules.land_ocean_coast.output,
+        rules.river_mask_filling.output,
+        rules.domain_location.output[0]
+    output: mapset("sinks")
+    shadow: "minimal"
+    threads: region_depending(lambda r: max(min(int(r["cells"]/2.5e8), 48), 2), 1)  # btw 2 - 48 cpus
+    params: dem=DEM_RASTER
+    shell:
+        """
+        grass -c {output} --exec r.mask land@$(basename {input[4]}) 
+        grass {output} --exec mfp_river_network.grass.sh sinks \
+            {params.dem} rivers_grwl@$(basename {input[1]}) \
+            lake_ids@$(basename {input[2]}) glwd_level_1@$(basename {input[3]}) \
+            $((7500*{threads})) $(basename {output})
+        # remove massive sink in Volga Delta in Caspian Sea
+        if [ "{wildcards.domain}"=="VOLG" ]; then
+            grass {output} --exec v.edit map=sinks bbox=3873180,5506770,4006860,5658960 tool=delete
+            grass {output} --exec v.to.rast sinks out=sinks use=val mem=3500 --o
+        fi
+        """
+
+
+rule r_watershed_sfd:
+    input:
+        DEM_MAPSET,
+        rules.dem_conditioning.output,
+        rules.sinks.output,
+        rules.land_ocean_coast.output,
+        rules.domain_location.output[0]
+    output: mapset("r_watershed_sfd")
+    threads: region_depending(lambda r: max(min(int(r["cells"]/2e8), 48), 4), 1)  # btw 4 - 48 cpus
+    shadow: "minimal"
+    resources:
+        time="12:00:00"
+    params: dem=DEM_RASTER
+    shell:
+        """
+        grass -c {output} --exec r.mask land@$(basename {input[3]}) 
+        grass {output} --exec mfp_river_network.grass.sh r_watershed_sfd \
+            {params.dem} dem_lowering@$(basename {input[1]}) sinks@$(basename {input[2]}) \
+            $((7500*{threads}-1000)) $(basename {output})
+        """
+
+
+rule gap_filled_network:
+    input:
+        rules.r_watershed_sfd.output,
+        rules.extent_coastal.output,
+        rules.vectorize.output,
+        rules.grwl_bank_distance.output,
+        rules.land_ocean_coast.output,
+        rules.domain_location.output[0]
+    output: mapset("gap_filled_network")
+    shadow: "minimal"
+    threads: region_depending(lambda r: int(r["cells"]/2e9)+1, 1)
+    shell:
+        """
+        grass -c {output} --exec mfp_river_network.grass.sh gap_filled_network \
+            accumulation_sqkm@$(basename {input[0]}) rivers_grwl@$(basename {input[1]}) \
+            rivers_cleaned@$(basename {input[2]}) bank_distance@$(basename {input[3]}) \
+            coast@$(basename {input[4]}) {threads} $(basename {output})
+        """
+
+
+rule build_river_network:
+    input:
+        rules.gap_filled_network.output,
+        rules.extent_coastal.output,
+        rules.r_watershed_sfd.output,
+        rules.interbasin_nodes.output,
+        rules.land_ocean_coast.output,
+        rules.sinks.output,
+        rules.domain_location.output[0]
+    output: mapset("build_river_network")
+    shadow: "minimal"
+    shell:
+        """
+        grass -c {output} --exec mfp_river_network.grass.sh build_river_network \
+            rivers@$(basename {input[0]}) \
+            river_width@$(basename {input[0]}) \
+            rivers_grwl@$(basename {input[1]}) \
+            accumulation_sqkm@$(basename {input[2]}) \
+            interbasin_nodes@$(basename {input[3]}) \
+            coast@$(basename {input[4]}) \
+            sinks@$(basename {input[5]}) \
+            $(basename {output})
+        """
+
+
+rule select_network_components:
+    input:
+        rules.build_river_network.output,
+        rules.gap_filled_network.output,
+        rules.extent_coastal.output,
+        rules.r_watershed_sfd.output,
+        DEM_MAPSET,
+        rules.domain_location.output[0]
+    output: mapset("select_network_components")
+    params: dem=DEM_RASTER
+    shell:
+        """
+        grass -c {output[0]} --exec mfp_river_network.grass.sh select_network_components \
+            segments@$(basename {input[0]}) \
+            river_width@$(basename {input[1]}) \
+            rivers_grwl@$(basename {input[2]}) \
+            accumulation_sqkm@$(basename {input[3]}) \
+            {params.dem} \
+            domain@PERMANENT \
+            potential_outlet_points@$(basename {input[0]}) \
+            $(basename {output[0]})
+        """
+
+
+rule osm_river_names:
+    input: rules.select_network_components.output, rules.osm_water_reproj.output
+    output: intermediate_output("osm_river_names/{domain}.csv")
+    shell:
+        """
+        tmpmaps=$(dirname {input[0]})/tmp_osm_river_names
+        rm -rf $tmpmaps
+        grass -c $tmpmaps --exec v.patch -e in=osm_water_lines@$(basename {input[1]}),osm_water_lines@$(basename {input[1]}) \
+            out=osm_water_lines
+        grass $tmpmaps --exec river_network_utils.py snap_osm_river_names \
+            segments@$(basename {input[0]}) osm_water_lines --output={output}
+        rm -rf $tmpmaps
+        """
+
+
+rule rivgraph_input:
+    input:
+        rules.select_network_components.output[0],
+        rules.gap_filled_network.output,
+        DEM_MAPSET,
+        rules.r_watershed_sfd.output,
+        rules.domain_location.output[0]
+    output: mapset("rivgraph_input"), directory(intermediate_output("rivgraph_input/{domain}"))
+    threads: 2
+    shadow: "minimal"
+    params: dem=DEM_RASTER
+    shell:
+        "grass -c {output[0]} --exec mfp_river_network.grass.sh rivgraph_input "+
+            "segments@$(basename {input[0]}) segments@$(basename {input[0]}) "+
+            "river_halfwidth@$(basename {input[1]}) {params.dem} accumulation_sqkm@$(basename {input[3]}) "+
+            "$(basename {output[0]}) {output[1]} ; "
+
+
+fixpath = osp.join(config["rivgraph_fixes"], "{domain}.gpkg")
+rule rivgraph_fixlinks:
+    input: rules.select_network_components.output[0], fixpath
+    output: directory(intermediate_output("rivgraph_fixlinks/{domain}"))
+    shell:
+        """
+        mkdir -p {output}
+        grass --tmp-mapset $(dirname {input[0]}) --exec river_network_utils.py rivgraph_fixlinks_from_lines \
+            {input[1]} segments@$(basename {input[0]}) {output}
+        """
+
+
+rule rivgraph:
+    input: lambda wc: [rules.rivgraph_input.output[1]] + ([rules.rivgraph_fixlinks.output[0]] if osp.exists(fixpath.format(domain=wc.domain)) else [])
+    output: directory(intermediate_output("rivgraph_output/{domain}"))
+    conda: conda_envs.rivgraph
+    params:
+        fl=lambda wc, input: input[1] if len(input) == 2 else ""
+    shell:
+        """
+        mkdir -p {output}
+        if [ ! -z "{params.fl}" ]; then
+            cp {params.fl}/* {output}
+        fi
+        module unload GDAL
+        multi_network_rivgraph.py multi_network_rivgraph \
+            {input[0]}/links.csv {input[0]}/nodes.csv "($(cat {input[0]}/cols_rows))" {output}
+        """
+
+
+rule directed_network:
+    input: rules.select_network_components.output[0], rules.rivgraph.output, rules.domain_location.output[0]
+    output: mapset("directed_network")
+    shell:
+        """
+        grass -c {output} --exec mfp_river_network.grass.sh rivgraph_output_to_grass segments@$(basename {input[0]}) \
+            {input[1]}/flipped_links.csv  \
+            $(if [ -f {input[1]}/nodes_direction_info.csv ]; then echo {input[1]}/nodes_direction_info.csv ; else echo None; fi) \
+            $(if [ -f {input[1]}/links_direction_info.csv ]; then echo {input[1]}/links_direction_info.csv ; else echo None; fi) \
+            $(basename {output})
+        """
+
+
+rule segments:
+    input: # must all be single values
+        network=rules.directed_network.output[0],
+        grwl_info=intermediate_output("raster_attributes/select_network_components/segments/grwl_patched@patch_grwl_gaps/{domain}.csv"),
+        darea_segment_info=intermediate_output("predictor_darea_sum/{domain}/segments.csv"),
+        darea_node_info=intermediate_output("predictor_darea_sum/{domain}/nodes.csv"),
+        darea_ms_segment_info=intermediate_output("predictor_darea_mainstem/{domain}/segments.csv"),
+        darea_ms_node_info=intermediate_output("predictor_darea_mainstem/{domain}/nodes.csv"),
+        osm_river_names=rules.osm_river_names.output[0],
+    output:
+        mapset=mapset("segments"),
+        csv_info=temp(intermediate_output("segments/csv_info/{domain}"))
+    params:
+        id_rank=lambda wc: DOMAIN_IDS.index(wc.domain),
+        # a csv string of csv input files with keys
+        csv=lambda wc, input: "\n".join([f"{k},{v}" for k, v in input.items() if osp.splitext(v)[-1] == ".csv"])
+    resources:
+        time=360
+    shell:
+        """
+        echo "{params.csv}" | tee {output.csv_info}
+        grass -c {output.mapset} --exec mfp_river_network.grass.sh segment_attributes \
+            segments@$(basename {input[0]}) {params.id_rank} {output.csv_info} $(basename {output.mapset})
+        """
+
+
+rule reaches:
+    input:
+        rules.extent_coastal.output,
+        rules.directed_network.output,
+        rules.select_network_components.output,
+        rules.domain_location.output[0],
+    output: mapset("reaches")
+    params: id_rank=lambda wc: DOMAIN_IDS.index(wc.domain)
+    shell:
+        """
+        grass -c {output} --exec mfp_river_network.grass.sh reaches \
+            segments@$(basename {input[1]}) segments@$(basename {input[2]}) \
+            rivers_grwl@$(basename {input[0]}) {params.id_rank} $(basename {output})
+        """
+
+
+rule reach_attributes:
+    input:
+        rules.reaches.output,
+        intermediate_output("raster_attributes/reaches/reaches/grwl_patched@patch_grwl_gaps/{domain}.csv"),
+        intermediate_output("raster_attributes/reaches/reaches/river_width@gap_filled_network/{domain}.csv"),
+        rules.domain_location.output[0],
+    output: mapset("reach_attributes")
+    shell:
+        """
+        grass -c {output} --exec mfp_river_network.grass.sh reach_attributes \
+            reaches@$(basename {input[0]}) {input[1]} {input[2]} $(basename {output})
+        """
+
+
+rule centerline_subbasins:
+    input: rules.r_watershed_sfd.output, rules.select_network_components.output[0], rules.domain_location.output[0]
+    output: mapset("centerline_subbasins")
+    threads: region_depending(lambda r: int(r["cells"]/(1.2e9)) + 1, 1)
+    shadow: "minimal"
+    shell:
+        "grass -c {output} --exec mfp_river_network.grass.sh centerline_subbasins drainage@$(basename {input[0]}) " +
+            "segments@$(basename {input[1]}) $(({threads}*7000)) $(basename {output})"
+
+
+rule centerline_points_table:
+    input:
+        rules.centerline_subbasins.output,
+        rules.reaches.output,
+        rules.r_watershed_sfd.output,
+        mapset("predictor_darea_mainstem"),
+        mapset("predictor_darea_sum")
+    output: intermediate_output("centerline_points_table/{domain}.csv")
+    shell:
+        """
+        echo x,y,centerline_id,reach_id,drainage_area,drainage_area_sfd,drainage_area_partitioned > {output}
+        grass --tmp-mapset $(dirname {input[0]}) --exec r.out.xyz sep=comma \
+            in=centerline_subbasins@$(basename {input[0]}),reaches@$(basename {input[1]}),darea@$(basename {input[3]}),accumulation_sqkm@$(basename {input[2]}),darea@$(basename {input[4]}) \
+            >> {output}
+        """
+
+
+rule catchments:
+    input:
+        rules.centerline_subbasins.output,
+        rules.centerline_points_table.output,
+        rules.reaches.output,
+        rules.land_ocean_coast.output,
+        rules.domain_location.output[0]
+    output: mapset("catchments")
+    shadow: "minimal"
+    threads: 2
+    shell:
+        """
+        grass -c {output} --exec mfp_river_network.grass.sh catchments \
+            {input[1]} centerline_subbasins@$(basename {input[0]}) \
+            reaches@$(basename {input[2]}) land@$(basename {input[3]}) $(basename {output})
+        """
+
+
+rule network_cache:
+    input:
+        rules.directed_network.output,
+        rules.select_network_components.output[0]
+    output: intermediate_output("network_cache/{domain}.pdpkl")
+    threads: 4
+    shell:
+        """
+        grass $(dirname {input[0]}) --tmp-mapset --exec network_routing.py create_dense_segments_cache \
+            segments@$(basename {input[0]}) segments@$(basename {input[1]}) {output}
+        """
+
+
+rule flow_accumulation:
+    input:
+        rules.r_watershed_sfd.output,
+        mapset("predictor_darea_sum")
+    output:
+        mapset("flow_accumulation")
+    #threads: region_depending(lambda r: max(int(r["cells"]/2e9), 1), 1)
+    shell:
+        """
+        grass -c {output} --exec mfp_river_network.grass.sh flow_accumulation \
+            accumulation_sqkm@$(basename {input[0]}) darea@$(basename {input[1]}) \
+            {threads} $(basename {output})
+        """
+
+rule hand:
+    input:
+        rules.r_watershed_sfd.output,
+        rules.network_cache.output,
+        rules.directed_network.output,
+        rules.select_network_components.output,
+        DEM_MAPSET,
+        rules.domain_location.output[0]
+    output:
+        mapset("hand")
+    shadow: "minimal"
+    threads: region_depending(lambda r: max(int(r["cells"]/2.5e8), 1), 1)
+    shell:
+        """
+        grass -c {output} --exec mfp_river_network.grass.sh height_above_nearest_drainage \
+            segments@$(basename {input[2]}) segments@$(basename {input[3]}) {input[1]} \
+            drainage@$(basename {input[0]}) fabdem@$(basename {input[4]}) $((6000*{threads}-1000)) \
+            $(basename {output})
+        """
+
+rule vector_attribute:
+    input: lambda wc: [mapset("{mapset}"), mapset(wc.raster.split("@")[1])]
+    output: intermediate_output("vector_attributes/{mapset}/{vector}/{layer}/{raster}/{domain}.csv")
+    resources:
+        time=60
+    shell:
+        """
+        grass --tmp-mapset $(dirname {input[0]}) --exec v.what.rast -p \
+            map={wildcards.vector}@{wildcards.mapset} layer={wildcards.layer} raster={wildcards.raster} | sort -n > {output}
+        """
+
+
+rule raster_zonal_stats:
+    input: lambda wc: [mapset("{mapset}"), mapset(wc.raster.split("@")[1])]
+    output: intermediate_output("raster_attributes/{mapset}/{zones_rast}/{raster}/{domain}.csv")
+    resources:
+        time=60
+    threads: lambda wc: 2 if wc.domain in ["AMAZ"] else 1
+    shell:
+        """
+        grass --tmp-mapset $(dirname {input[0]}) --exec r.univar -e \
+            map={wildcards.raster} zones={wildcards.zones_rast}@{wildcards.mapset} -t output={output} sep=comma
+        """

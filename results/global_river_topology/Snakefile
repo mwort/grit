@@ -1,0 +1,62 @@
+from snakemake_utils import conda_envs, group_permissions_hook
+
+include: "Snakefile_input_data"
+include: "Snakefile_core"
+include: "Snakefile_output_data"
+include: "Snakefile_predictors"
+include: "Snakefile_validation"
+include: "Snakefile_tables_figures"
+
+configfile: "GRIT_config.yml"
+
+VERSION = config["version"]
+
+
+# default workflow output
+rule all:
+    input:
+        output_vector_files("segments", "segments", "segments_simple", zenodo=True),
+        output_vector_files("segments", "segments_simple", regions=['GLOBAL'], zenodo=True),
+        output_vector_files("directed_network", "cycles", "discontinuities", regions=["GLOBAL"]),
+        output_vector_files("reaches", "reaches_simple", zenodo=True),
+        output_vector_files("reach_attributes", "reaches", zenodo=True),
+        output_vector_files("sinks", "sinks", regions=['GLOBAL'], zenodo=True),
+        output_vector_files("catchments", "component_catchments", zenodo=True),
+        output_vector_files("catchments", "segment_catchments", "reach_catchments", zenodo=False),
+        output_vector_files("PERMANENT", "domain", zenodo=True, regions=["GLOBAL"])
+        #output_raster("flow_accumulation", "drainage_area")
+        #output_vector_file("hand", "hand", "tile_index", epsg="4326"),
+        #output_vector_file("extent_coastal", "rivers_grwl", "tile_index", epsg="4326")
+
+
+
+rule figures:
+    input:
+        f"figures_{VERSION}/plot_drainage_area_map.png",
+        f"figures_{VERSION}/plot_bifurcations_hexbin_map.png",
+        f"figures_{VERSION}/plot_merit_comparison.png",
+        f"figures_{VERSION}/plot_didnt_comparison_map.png"
+
+rule diagnostics:
+    input: expand(output("diagnostics/{file}.csv"), file=DIAGNOSTICS.index)
+
+# postprocess output on job completion, make sure all output files have group write permissions
+onsuccess:
+    group_permissions_hook(log)
+
+onerror:
+    group_permissions_hook()
+
+
+# workflow graphs (for default output)
+rule rulegraph_dot:
+    output: expand("rulegraph.{ext}", ext=("dot", "pdf"))
+    shell:
+        "snakemake --rulegraph --use-conda > {output[0]} ; dot -Tpdf -o {output[1]} {output[0]}"
+
+rule rulegraph:
+    input: rules.rulegraph_dot.output[0]
+    output: "rulegraph_trimmed.pdf"
+    conda: conda_envs.rivgraph
+    shell: "sparse_dot_graph.py {input} {output}"
+

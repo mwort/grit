@@ -1,0 +1,39 @@
+from snakemake_utils import DATA_DIR, conda_envs
+import pandas as pd
+
+
+domain_experiments = pd.read_csv("domain_experiments.csv", header=None)
+
+rule all:
+    input: expand('domains_{i:02g}', i=range(len(domain_experiments)))
+
+
+rule lonlat_loc:
+    output: directory('GRASS/lonlat')
+    shell: "grass -e -c EPSG:4326 {output}"
+
+
+rule clean_wmo_basins:
+    input:
+        location=rules.lonlat_loc.output,
+        basins=DATA_DIR/"GRDC/WMO_regions/wmobb_basins.json"
+    output: "wmobb_basins_clean.gpkg"
+    shell:
+        "grass -c {input.location}/WMO_basins --exec clean_WMO_basins.grass.sh {input.basins} {output}"
+
+
+rule split_remove_basins:
+    input: rules.clean_wmo_basins.output, "deselected_areas.geojson", "basin_split_lines.geojson"
+    output: "wmobb_basins_selected.gpkg"
+    conda: conda_envs.geopandas
+    shell: "domain_disaggregation.py tweak_basins {input} {output} - __repr__"
+
+
+rule domains_analysis:
+    input: rules.split_remove_basins.output
+    output: directory("experiments/2/domains_{i}")
+    conda: conda_envs.geopandas
+    params:
+        args=lambda wc: domain_experiments.loc[int(wc.i), 0]
+    shell:
+        "domain_disaggregation.py domains_with_analysis {input} {output} {params.args}"

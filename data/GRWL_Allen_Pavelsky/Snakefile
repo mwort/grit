@@ -1,0 +1,71 @@
+from glob import glob
+import os.path as osp
+from collections import defaultdict
+
+from snakemake_grass import GrassLocation, input_to_map, output_to_map
+from snakemake_utils import conda_envs
+
+
+mask_files = glob("GRWL_mask_V01.01/????.tif")
+locs, maps = defaultdict(lambda: list()), []
+for f in sorted(mask_files):
+    ns,l,i1,i2 = osp.basename(osp.splitext(f)[0])
+    locs[ns+i1+i2].append(f)
+    maps.append(f"GRASS/UTM_{ns}{i1+i2}/{ns}{l}{i1+i2}")
+
+
+rule all:
+    input: maps, "GRWL_ROIs.zip", "GRASS/lonlat/tiles"
+
+
+rule ee_gmt_location:
+    output: directory("GRASS/EE_GMT/PERMANENT")
+    shell: """
+        rm -r $(dirname {output}); grass -e -c EPSG:8857 $(dirname {output})
+        grass {output} --exec g.proj datum=wgs84 -c
+        """
+
+
+rule lonlat_location:
+    output: directory("GRASS/lonlat/PERMANENT")
+    shell: """rm -r $(dirname {output}); grass -e -c EPSG:4326 $(dirname {output})"""
+
+
+rule roi_tiles:
+    input: "GRWLtiles/IMWtiles_existing.shp", rules.lonlat_location.output
+    output: directory("GRASS/lonlat/tiles")
+    shell: "grass -c {output} --exec v.in.ogr in={input[0]} out=all_tiles"
+
+
+rule utm_location:
+    input: lambda wc: locs[wc.NS + wc.number][0]
+    output: directory("GRASS/UTM_{NS,.}{number}/PERMANENT")
+    shell: "rm -r $(dirname {output}); grass -e -c {input} $(dirname {output})"
+
+
+rule tile:
+    input:
+        file="GRWL_mask_V01.01/{NS}{L}{number}.tif",
+        gapfill="RW_in/{NS}{L}{number}_RW_in.img",
+        location=rules.utm_location.output
+    output:
+        directory("GRASS/UTM_{NS,.}{number}/{NS}{L,.}{number}"),
+        temp(directory("GRASS/lonlat/{NS}{L,.}{number}"))
+    params:
+        name=lambda wc: wc.NS + wc.L + wc.number
+    shell:
+        "grass -c {output[1]} --exec v.extract all_tiles@tiles where=\"TILE_ID='{params.name}'\" output=tile ; " +
+        "grass -c {output[0]} --exec ./import_tile.grass.sh {input.file} {input.gapfill} {params.name}"
+
+
+rule rois:
+    input: ["ROIs/%s.geojson" % osp.basename(m) for m in maps]
+    output: "GRWL_ROIs.zip"
+    shell: "zip {output} {input}"
+
+
+rule roi_file:
+    input: rules.tile.output
+    output: "ROIs/{NS,.}{L,.}{number}.geojson"
+    shell: "grass {input[0]} --exec v.out.ogr input=ROI format=GeoJSON output={output}"
+

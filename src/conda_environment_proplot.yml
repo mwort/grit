@@ -1,0 +1,16 @@
+name: ef-proplot
+channels:
+    - conda-forge
+dependencies:
+    - pandas
+    - proplot
+    - cartopy
+    - geopandas
+    - ipython
+    - fire
+    - tqdm  # progress reporting
+    - pip
+    - pip:
+        - ipdb
+        - matplotlib-scalebar
+

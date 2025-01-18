@@ -1,0 +1,18 @@
+
+# Commands used within grass mapsets to write out statistics/diagnostics
+# commands are placed behind the "grass --exec" statement for each mapset
+# all cmd commands should output csv or pipe-separated format with header
+name,mapset,cmd
+osm_river_line_length,osm_water,"v.to.db -p osm_water_lines@osm_water opt=length sep=comma"
+#gswe_patches,gswe_coastal_grwl,"r.stats land@land_ocean_coast,water__clumped,coastal_water -cn sep=comma | sed '1i land,clump,grwl,ncells'"
+sinks,sinks,"v.to.db -p map=sinks opt=area sep=comma"
+large_lakes,grwl_lakes,"v.db.select large_lakes sep=comma"
+interbasin_nodes,interbasin_nodes,"v.db.select interbasin_nodes sep=comma"
+network_lines,segments,v.db.select segments layer=1
+network_nodes,segments,v.db.select segments layer=2
+cycles,directed_network,"v.db.select segments_with_cycles where='cycle>0' group=cycle col='cycle,count(cat),cycle_io,comp' sep=comma"
+discontinuity_nodes,directed_network,v.db.select segments_with_cycles layer=2 where="continuity_violated=1" sep=comma
+rivgraph_algorithms,directed_network,"v.db.select segments group=certain_alg col='certain_alg,count(cat)' sep=comma"
+reach_lines,reaches,v.db.select reaches layer=1
+total_drainage_share,PERMANENT,echo see total_drainage_share rule
+grdc_stations,stations_snapped_grdc,"v.db.select stations_snapped sep=comma"

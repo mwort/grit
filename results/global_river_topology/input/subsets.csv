@@ -1,0 +1,18 @@
+,name,label,domain_id
+0,Pearl at Guangzhou,guangzhou,YANG
+1,Mekong at My Thuan,mekong,MEKO
+2,Brahmaputra at Dhubri,brahmaputra,GANG
+3,Chenab-Indus confluence,indus,GANG
+4,Danube at Vienna,vienna,DANU
+5,Po at Cremona,po,DANU
+6,Seine at Paris,paris,DANU
+7,Rhine at Rotterdam,rotterdam,DANU
+8,Mississippi at Three Rivers,mississippi,MISS
+9,St Lawrence at Montreal,montreal,HUDS
+10,Amazon at Manaus,manaus,AMAZ
+11,Casiquiare bifurcation/Orinoco,orinoco,ORIN
+12,Niger at Diafrabé,innerniger,CHAD
+13,Niger-Forcados bifurcation,nigerdelta,CHAD
+14,Nile at Cairo,cairo,NILE
+15,Lena at Yakutsk,lena,LENA
+16,Dnipro at Kyiv,kyiv,VOLG

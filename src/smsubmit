@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+
+smcmd="snakemake --profile $PROJECT_ROOT/src/snakemake_slurm_profiles/slurm $@"
+cpu=1
+
+echo "Any cleaning?"
+select yn in "None" "Logs and snakemake lock" "Logs only" "Lock only"; do
+    case $yn in
+        "None" ) break;;
+        "Logs and snakemake lock" ) snakemake --use-conda --unlock; rm -f log/*.log; break;;
+        "Logs only" ) rm -f log/*.log; break;;
+        "Lock only" ) snakemake --use-conda --unlock; break;;
+    esac
+done
+
+echo "Time of job (hours, 0 to not submit master, negative to submit as single job)? (default: 12)"
+read hrs
+hrs="${hrs:=12}"
+hrsabs="$(echo $hrs | tr -d -)"
+if (( $hrsabs > 48 )); then
+    p=long
+elif (( $hrsabs > 12 )); then
+    p=medium
+elif (( $hrsabs > 4 )); then
+    p=short
+else
+    p=interactive
+fi
+# Prompt the user to enter the parameter priority
+echo "Do you want to set the parameter priority? (yes/no, default: no)"
+read priority_input
+priority=${priority_input:-no}
+# Set priority based on user input
+if [[ "$priority" != "yes" ]]; then
+    priority="no"
+fi
+echo "Priority: ${priority}"
+
+if (( $hrs < 0 )); then
+    echo "N CPUs for single job? (default 1)"
+    read cpu
+    cpu="${cpu:=1}"
+    smcmd="snakemake --use-conda -j $cpu  $@"
+    hrs=$hrsabs
+fi
+
+if (( $hrs > 0 )); then
+    # Check if priority is set to "yes"
+    if [[ "$priority" == "yes" ]]; then
+        sbatch -p $p -c $cpu --time="$hrs:00:00" --clusters="arc" --qos="priority" --wrap="$smcmd" -J sm_master_$(basename $(pwd))
+    else
+        sbatch -p $p -c $cpu --time="$hrs:00:00" --clusters="arc" --wrap="$smcmd" -J sm_master_$(basename $(pwd))
+    fi
+else
+    $smcmd
+fi

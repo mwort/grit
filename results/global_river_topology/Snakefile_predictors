@@ -1,0 +1,205 @@
+import os.path as osp
+from pathlib import Path as P
+import numpy as np
+import pandas as pd
+
+from snakemake_utils import conda_envs
+
+include: "Snakefile_input_data"
+include: "Snakefile_output_data"
+include: "Snakefile_core"
+
+configfile: "GRIT_config.yml"
+
+DATA = P(os.environ["PROJECT_ROOT"])/"data"
+
+PREDICTORS = pd.read_csv(config["predictors_info"], index_col=0)
+PREDICTORS["aggregate_raster"] = PREDICTORS.apply(
+    lambda r: (r['raster@mapset'] if r['aggregate'] == 'none'
+               else "{0}@{1}_predictor_{0}".format(r.name, r["aggregate"])),
+    axis=1,
+)
+
+STATIONS = {
+    "grdc": (DATA/"GRDC/GRDC_stations.geojson", "grdc_no", "area"),
+    "reference": ("../bankfull_training_dataset/stations_qbf.gpkg", "station_id", "drainage_area"),
+}
+
+
+rule stations:
+    input: lambda wc: [STATIONS[wc.name][0], rules.domain_location.output[0]]
+    output: mapset("stations_{name,%s}" % ("|".join(STATIONS.keys())))
+    resources:
+        time=30
+    params:
+        drainage_area_column=lambda wc: STATIONS[wc.name][2],
+        cat_column=lambda wc: STATIONS[wc.name][1]
+    shell:
+        """
+        grass -c {output} --exec v.import in={input[0]} output=stations_all extent=region
+        if [ -d {output}/vector/stations_all ]; then
+            [[ {params.drainage_area_column} != drainage_area ]] && grass {output} --exec \
+                v.db.renamecolumn map=stations_all column={params.drainage_area_column},drainage_area
+            grass {output} --exec v.reclass stations_all out=stations_all_cats column={params.cat_column}
+            grass {output} --exec v.db.addtable stations_all_cats
+            grass {output} --exec v.db.join stations_all_cats col=cat other_ta=stations_all other_col={params.cat_column}
+            grass {output} --exec v.db.droprow input=stations_all_cats where="drainage_area<50" output=stations_selected
+            grass {output} --exec v.select ain=stations_selected bin=domain@PERMANENT out=stations
+        else  # create empty to avoid problems with dependency jobs
+            grass {output} --exec mfp_river_network.grass.sh create_empty_vector stations
+        fi
+        """
+
+
+rule grdc_runoff:
+    input: DATA/"GRDC/GRASS/lonlat/PERMANENT"
+    output: mapset("grdc_runoff")
+    shell:
+        """
+        grass -c {output} --exec g.region -a res=25000
+        grass {output} --exec r.proj input=cmp_ro loc=$(basename $(dirname {input})) \
+            mapset=$(basename {input}) dbase=$(dirname $(dirname {input})) \
+            res=25000 method=bilinear memory=6000
+        grass {output} --exec r.mapcalc exp="runoff_cell_cumecs__=cmp_ro/1000 * area() / (365.25 * 60 * 60 * 24)"
+        grass {output} --exec r.grow.distance runoff_cell_cumecs__ value=runoff_cell_cumecs
+        """
+
+rule reservoirs:
+    input: DATA/"GRanD/GRanD_Version_1_3/GRanD_dams_v1_3.shp"
+    output: mapset("reservoirs")
+    shell:
+        """
+        grass -c {output} --exec v.import in={input} extent=region
+        if [ -d {output}/vector/GRanD_dams_v1_3 ]; then
+            grass {output} --exec v.to.rast in=GRanD_dams_v1_3 type=point output=GRanD_CAP_MCM \
+                use=attr attribute_column=CAP_MCM memory=6000
+            grass {output} --exec r.null GRanD_CAP_MCM null=0
+        else
+            grass {output} --exec r.mapcalc exp="GRanD_CAP_MCM=0"
+        fi
+        """
+
+rule era5:
+    input: DATA/"ECMWF_ERA5/GRASS/lonlat/era5"
+    output: mapset("era5")
+    shell:
+        """
+        grass -c {output} --exec g.region -a res=20000
+        for v in 2m_temperature_mean_dgc total_precipitation_mean_mma ; do
+            grass {output} --exec r.proj input=$v loc=$(basename $(dirname {input})) \
+                mapset=$(basename {input}) dbase=$(dirname $(dirname {input})) \
+                method=bilinear memory=6000
+        done
+        """
+rule ai:
+    input: DATA/"Global_AI_ET0_annual_v3/GRASS/lonlat/ai"
+    output: mapset("ai")
+    shell:
+        """
+        grass -c {output} --exec g.region -a res=1000
+        grass {output} --exec r.proj input=ai loc=$(basename $(dirname {input})) \
+            mapset=$(basename {input}) dbase=$(dirname $(dirname {input})) \
+            method=bilinear memory=6000
+        grass {output} --exec r.mapcalc exp="ai_mean=ai*0.0001"
+        """
+
+rule stations_snapped:
+    input: mapset("stations_{name}"), rules.centerline_points_table.output
+    output: mapset("stations_snapped_{name}")
+    conda: conda_envs.geopandas
+    threads: region_depending(lambda r: max(int(r["cells"]/3e9), 1), 1)
+    resources:
+        time=120
+    shell:
+        """
+        grass -c {output[0]} --exec mfp_river_network.grass.sh snap_stations \
+            stations@$(basename {input[0]}) {input[1]} $(basename {output})
+        """
+
+
+rule stations_osm_riverbank:
+    input: rules.osm_water_reproj.output, mapset("stations_snapped_grdc"), mapset("reaches")
+    output: mapset("stations_osm_riverbank")
+    shell:
+        """
+        grass -c {output} --exec mfp_river_network.grass.sh stations_osm_riverbank stations_valid@$(basename {input[1]}) \
+            osm_water_polygons@osm_water reaches@reaches $(basename {output})
+        """
+
+
+def predictor_input(wc):
+    inp = {
+        "vector": rules.directed_network.output,
+        "raster": rules.select_network_components.output[0],
+        "subbasins": rules.centerline_subbasins.output,
+        "network": rules.network_cache.output,
+        "predictor_mapset": mapset(PREDICTORS.loc[wc.key, "raster@mapset"].split("@")[1]),
+    }
+    if wc.method == "mean":
+        inp["ncells"] = mapset("predictor_ncells_sum")
+    return inp
+
+rule predictor_routing:
+    input: unpack(predictor_input)
+    output:
+        mapset=mapset("predictor_{key}_{method}"),
+        node_info=intermediate_output("predictor_{key}_{method}/{domain}/nodes.csv"),
+        segment_info=intermediate_output("predictor_{key}_{method}/{domain}/segments.csv"),
+    threads: 2
+    resources:
+        time=120
+    params:
+        args=lambda wc: PREDICTORS.loc[wc.key, "raster@mapset"],
+        ncells=lambda wc, input: "ncells@"+osp.basename(input.ncells) if wc.method == "mean" else "None"
+    shell:
+        """
+        grass -c {output.mapset} --exec network_routing.py route-value {params.args} \
+            --method={wildcards.method} --width-column=wid_adj \
+            --ncells-raster={params.ncells} \
+            --network-vector=segments@$(basename {input.vector}) \
+            --segments-raster=segments@$(basename {input.raster}) \
+            --centreline-subbasins=centerline_subbasins@$(basename {input.subbasins}) \
+            --network-cache={input.network} \
+            --width_column=bifurcation_share \
+            --output-raster={wildcards.key} --output-segments-csv={output.segment_info} \
+            --output-nodes-csv={output.node_info}
+        """
+
+
+rule station_predictors:
+    input:
+        expand(intermediate_output("vector_attributes/stations_snapped_reference/stations_valid/1/{raster}/{domain}.csv"),
+               raster=PREDICTORS.aggregate_raster, domain=DOMAIN_IDS)
+    output: f"output_{config['version']}/station_predictors.csv"
+    run:
+        from io import StringIO
+        pnames, data = [], []
+        rastmap = dict(zip(PREDICTORS["aggregate_raster"], PREDICTORS.index))
+        for i in input:
+            csv = open(i).read()
+            if len(csv):
+                data.append(pd.read_csv(StringIO(csv), header=None, index_col=0, delimiter="|")[1])
+                pnames.append((rastmap[osp.basename(osp.dirname(i))], osp.splitext(osp.basename(i))[0]))
+        df = pd.concat(data, axis=0, keys=pnames, names=["predictor", "domain", "station_id"]).unstack("predictor")
+        df.swaplevel("domain", "station_id").to_csv(output[0])
+
+
+rule reach_predictors:
+    input:
+        expand(intermediate_output("raster_attributes/reaches/reaches/{raster}/{domain}.csv"),
+               raster=PREDICTORS.aggregate_raster, domain=DOMAIN_IDS)
+    output: f"output_{config['version']}/reach_predictors.csv"
+    threads: 8
+    run:
+        from io import StringIO
+        from tqdm import tqdm
+        pnames, data = [], []
+        rastmap = dict(zip(PREDICTORS["aggregate_raster"], PREDICTORS.index))
+        for i in tqdm(input):
+            csv = open(i).read()
+            if len(csv):
+                data.append(pd.read_csv(StringIO(csv), index_col=0)["median"])
+                pnames.append((rastmap[osp.basename(osp.dirname(i))], osp.splitext(osp.basename(i))[0]))
+        df = pd.concat(data, axis=0, keys=pnames, names=["predictor", "domain", "reach_id"]).unstack("predictor")
+        df.to_csv(output[0])
+

@@ -1,0 +1,154 @@
+import os.path as osp
+from pathlib import Path as P
+
+import pandas as pd
+from snakemake_utils import conda_envs
+
+
+configfile: "GRIT_config.yml"
+include: "Snakefile_input_data"
+include: "Snakefile_output_data"
+
+VERSION = config["version"]
+FIGURES = P(f"figures_{VERSION}")
+TABLES = P(f"output_{VERSION}/tables")
+
+def subset_tbl(wc):
+    # this ensures subsets_csv exists
+    return pd.read_csv(checkpoints.subsets_csv.get(**wc).output[0], index_col="label")
+
+
+rule tbl_direction_problems:
+    input: expand(output("diagnostics/network_{t}.csv"), t=("lines", "nodes"))
+    output: TABLES/"direction_problems.csv"
+    run:
+        lns = pd.read_csv(input[0]).groupby(["domain_id", "comp"])
+        nds = pd.read_csv(input[1]).groupby("domain_id")
+        nc = lns.agg({
+            "cycle": lambda c: len(c[c > 0].unique()),
+            "certain_alg": lambda c: (c==29).sum(),
+        }).rename(columns={"cycle": "n_cycles", "certain_alg": "n_random"})
+        nc["n_lines"] = lns.cat.count()
+        tbl = nc.groupby(level="domain_id").sum()
+        tbl["n_nodes"] = nds.cat.count()
+        tbl["n_discontinuity"] = nds.continuity_violated.agg(lambda c: (c==1).sum())
+        tbl.loc["sum"] = tbl.sum()
+        tbl.to_csv(output[0])
+
+
+rule drainage_area_map:
+    input:
+        output_vector_file("segments", "segments_simple"),
+        output_vector_file("sinks", "sinks")
+    output: FIGURES/"plot_drainage_area_map.png"
+    conda: conda_envs.proplot
+    shell: "plot_global_segment_map.py {input} --output={output}"
+
+
+rule bifurcations_hexbin_map:
+    input:
+        output_vector_file("segments", "segments_simple"),
+        output_vector_file("PERMANENT", "domain"),
+        "input/regions_separation_lines.gpkg"
+    output: FIGURES/"plot_bifurcations_hexbin_map.png"
+    conda: conda_envs.proplot
+    shell: str(FIGURES)+"/plot_bifurcations_hexbin_map.py {input} --output={output}"
+
+
+rule import_worldpop:
+    input:
+        DATA/"WorldPop/WorldPop_iso_countries_1km.gpkg",
+        DATA/"WorldPop/GRASS/lonlat",
+        rules.domain_location.output[0]
+    output: mapset("worldpop", lonlat=True)
+    shell:
+        """
+        grass -c {output} --exec worldpop_processing.grass.sh import {input[0]} {input[1]} \
+            domain@PERMANENT $(basename {output})
+        """
+
+rule import_gdp:
+    input: DATA/"GDP_HDI_population_Kummu_etal/GDP_PPP_30arcsec_v3_2015.tif"
+    output: mapset("gdp", lonlat=True)
+    shell:
+        """
+        grass -c {output} --exec r.import in={input} out=GDP_PPP_30arcsec_v3_2015 \
+            ext=region
+        """
+
+valid_maps = [
+    ("segments", "segments_simple"),
+    #("segments", "segments"),
+    ("sinks", "sinks"),
+    ("stations_snapped_grdc", "stations_snapped"),
+    ("PERMANENT", "domain"),
+]
+rule visual_validation:
+    input: **{n: output_vector_file(m, n, region="{region}") for m, n in valid_maps}
+    output: FIGURES/"plot_visual_validation_map_{region}.png"
+    conda: conda_envs.proplot
+    params:
+        args=lambda wc, input: [f"--{n}={p}" for n, p in input.items()]
+    shell: f"figures_{VERSION}/plot_visual_validation_map.py {{params.args}} --output={{output}}"
+
+
+checkpoint subsets_csv:
+    input: "input/subsets.gpkg"
+    output: "input/subsets.csv"
+    conda: conda_envs.geopandas
+    shell: "geopandas_utils.py geo_to_csv {input} {output}"
+
+
+def subset_mapset(wc):
+    ll = "_lonlat"
+    dom = subset_tbl(wc).loc[wc.roi, 'domain_id'] + (ll if wc.mapset.endswith(ll) else "")
+    return osp.join("GRASS", dom, wc.mapset.replace(ll, ""))
+
+rule subset_grass_map:
+    input: gpkg=rules.subsets_csv.input, ms=subset_mapset
+    output: FIGURES/"subsets/{roi}/{map}__{mapset}.{ext}"
+    resources:
+        time=15
+    params:
+        command=lambda wc: {"tif": "raster", "gpkg": "vector"}[wc.ext],
+        ms=lambda wc: wc.mapset.replace("_lonlat", "")
+    shell:
+        """
+        tmp_ms=$(dirname {input.ms})/subset__{wildcards.roi}__{wildcards.map}__{wildcards.mapset}__$$
+        rm -rf $tmp_ms && grass -c $tmp_ms --exec v.import {input.gpkg} output=subsets
+        region=$(grass $tmp_ms --exec v.db.select subsets where="label='{wildcards.roi}'" -r)
+        grass $tmp_ms --exec g.region -a $region {params.command}={wildcards.map}@{params.ms}
+        grass $tmp_ms --exec cut.grass.sh cut_{params.command} -p {wildcards.map}@{params.ms} {output}
+        rm -rf $tmp_ms
+        """
+
+
+rule subset_comparison_maps:
+    input:
+        maps = [FIGURES/"subsets/{roi}/drainage_area__flow_accumulation.tif",
+                FIGURES/"subsets/{roi}/grwl__grwl.tif",
+                FIGURES/"subsets/{roi}/upa__merit_raster_upa_lonlat.tif",
+                FIGURES/"subsets/{roi}/upa__hydrosheds_raster_upa_lonlat.tif",
+                FIGURES/"subsets/{roi}/reaches__reach_attributes.gpkg",
+                FIGURES/"subsets/{roi}/segments__segments.gpkg",
+               ],
+        sstbl = rules.subsets_csv.output
+    output: FIGURES/"subset_maps/plot_comparison_maps_{roi}.png"
+    resources:
+        time=15
+    conda: conda_envs.proplot
+    params:
+        title=lambda wc: subset_tbl(wc).loc[wc.roi, "name"]
+    shell: "figures_v05/plot_detail_comparison_maps.py {input.maps} --output={output} --title='{params.title}'"
+
+rule subset_figures:
+    input: lambda wc: expand(rules.subset_comparison_maps.output, roi=subset_tbl(wc).index)
+
+
+rule plot_station_snapping:
+    input:
+        expand(output_vector_file("{ms}", "stations_snapped"),
+               ms=["stations_snapped_grdc", "merit_stations_snapped", "hydrosheds_stations_snapped"])
+    output: FIGURES/"plot_station_snapping_comparison.png"
+    conda: conda_envs.proplot
+    shell: f"{FIGURES}/plot_station_snapping_comparison.py {{input}} --output {{output}}"

@@ -1,0 +1,19 @@
+name: ef-base
+channels:
+    - conda-forge
+dependencies:
+    - pandas
+    - bioconda::snakemake-minimal
+    - matplotlib
+    - seaborn
+    - ipython
+    - mamba
+    - fire
+    - tqdm  # progress reporting
+    - networkx
+    - lxml  # read HTML tables with pandas
+    - pip
+    - pip:
+        - ipdb
+        - cookiecutter
+        - -e src/snakemake_grass

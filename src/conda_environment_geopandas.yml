@@ -1,0 +1,15 @@
+name: ef-geopandas
+channels:
+    - conda-forge
+dependencies:
+    - geopandas
+    - matplotlib
+    - ipython
+    - mamba
+    - fire
+    - tqdm  # progress reporting
+    - rtree
+    - pygeos
+    - pip
+    - pip:
+        - ipdb

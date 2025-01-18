@@ -1,0 +1,253 @@
+from snakemake_utils import conda_envs
+
+
+include: "Snakefile_input_data"
+configfile: "GRIT_config.yml"
+
+DIDNT_DOMAINS = 'AMAZ MACK DANU VOLG GANG YANG BAYO BORN MEKO MISS CHAD ORIN RIOD YENI NEW1 LENA'.split()
+NHD_DOMAINS = "MISS GULF COLU HUDS NOR2".split()
+
+
+rule import_merit_raster_lonlat:
+    input: DATA/"MERITHydro"/"{name}.vrt", rules.domain_location_lonlat.output
+    output: mapset("merit_raster_{name}", lonlat=True)
+    threads: 2
+    shadow: "minimal"
+    resources:
+        time=8*60
+    shell:
+        "grass -c {output} --exec r.in.gdal -r input={input[0]} output={wildcards.name} memory=12000"
+
+
+rule import_merit_raster_metric:
+    input:
+        rules.import_merit_raster_lonlat.output,
+        rules.domain_location.output[0],
+        rules.domain_location_lonlat.output
+    output: mapset("merit_raster_{name}")
+    threads: 2
+    resources:
+        time=8*60
+    shadow: "minimal"
+    params:
+        method=lambda wc: "bilinear" if wc.name in ("elv", "hnd") else "nearest"
+    shell:
+        "grass -c {output} --exec g.region -a res=90 ; "
+        "grass {output} --exec r.proj location=$(basename $(dirname {input[0]})) mapset=$(basename {input[0]}) "
+            "input={wildcards.name} output={wildcards.name} res=90 memory=12000"
+
+
+merit_names = ["elv", "dir", "upa", "wth", "hnd"]
+rule merit:
+    input: mapsets("merit_raster_{name}", name=merit_names)
+    output: mapset("merit")
+    resources:
+        time=5*60
+    params: gcopy=",".join([f"{n}@merit_raster_{n},{n}" for n in merit_names]) 
+    shell: "grass -c {output} --exec g.copy raster={params.gcopy}"
+
+
+def hydrosheds_continent(wc):
+    rc = DOMAINS_TBL.loc[wc.domain, "region_code"].lower()
+    return {"sp": "au", "si": "as"}.get(rc, rc)
+
+rule hydrosheds:
+    input: lambda wc: (DATA/f"HydroSheds/raw/{hydrosheds_continent(wc)}_acc_3s.tif", DATA/f"HydroSheds/raw/hyd_glo_aca_15s.tif")
+    output: mapsets("hydrosheds_raster_upa", lonlat=True)
+    params:
+        continent=hydrosheds_continent
+    shell:
+        """
+        grass -c {output} --exec r.in.gdal in={input[0]} out=upa__cells memory=6500 -r || \
+            grass {output} --exec r.mapcalc exp="upa__cells=null()"
+        grass {output} --exec r.in.gdal in={input[1]} out=upa__15s memory=6500 -r  # upa in hectars
+        grass {output} --exec r.null upa__cells setnull=2147483647
+        grass {output} --exec r.null upa__15s setnull=2147483647
+        grass {output} --exec g.region -pa res=0:00:03
+        grass {output} --exec r.mapcalc exp="upa=if(isnull(upa__cells), upa__15s/100, upa__cells*area()/1000000)"
+        """
+
+
+rule hydrography_streams:
+    input: ancient(mapset("{hydrography}_raster_upa", lonlat=True))
+    output: mapset("{hydrography}_streams", lonlat=True)
+    threads: 2
+    shell:
+        """
+        cat <<EOF > /tmp/tmp_hydrography_streams_$$
+        g.region rast=upa@$(basename {input[0]})
+        r.mapcalc exp="streams__thick=if(abs(upa@$(basename {input[0]})) > 50, 1, null())"
+        r.thin in=streams__thick out=streams
+        r.to.vect streams out=stream_points type=point
+        v.what.rast stream_points rast=upa@$(basename {input[0]}) col=drainage_area
+EOF
+        grass -c {output[0]} --exec bash /tmp/tmp_hydrography_streams_$$
+        rm /tmp/tmp_hydrography_streams_$$
+        """
+
+
+rule hydrography_stations_snapped:
+    input: mapset("{hydrography}_raster_upa", lonlat=True), mapset("stations_grdc"), rules.hydrography_streams.output
+    output: mapset("{hydrography}_stations_snapped"), intermediate_output("{hydrography}_centerline_points_table/{domain}.csv")
+    conda: conda_envs.geopandas
+    threads: region_depending(lambda r: max(int(r["cells"]/3e9), 1), 1)
+    shell:
+        """
+        grass -c {output[0]} --exec v.proj in=stream_points map=$(basename {input[2]}) loc=$(basename $(dirname {input[2]}))
+        sleep 10
+        echo x,y,stream_cat,drainage_area > {output[1]}
+        grass {output[0]} --exec v.out.ascii stream_points sep=comma col=drainage_area >> {output[1]}
+        grass {output[0]} --exec mfp_river_network.grass.sh snap_stations stations@$(basename {input[1]}) {output[1]} $(basename {output[0]})
+        if [ ! -d {output[0]}/vector/stations_snapped ]; then grass {output[0]} --exec mfp_river_network.grass.sh create_empty_vector stations_snapped; fi
+        """
+
+
+rule plot_station_snap_comparison:
+    input:
+        data=(f"output_{config['version']}/stations_snapped_grdc/GRIT{config['version']}_stations_snapped_GLOBAL.gpkg",
+              f"output_{config['version']}/merit_stations_snapped/GRIT{config['version']}_stations_snapped_GLOBAL.gpkg",
+              f"output_{config['version']}/hydrosheds_stations_snapped/GRIT{config['version']}_stations_snapped_GLOBAL.gpkg"),
+        script=f"figures_{config['version']}/plot_merit_comparison.py"
+    output: f"figures_{config['version']}/plot_merit_comparison.png"
+    conda: conda_envs.proplot
+    shell:
+        "python {input.script} {input.data} {output}"
+
+
+rule didnt_network:
+    input: DATA/"DIDNT_Hariharan_et_al/DIDNT_links.gpkg", rules.domain_location.output[0]
+    output: mapset("didnt_network")
+    shell: "grass -c {output} --exec v.import extent=region in={input[0]} out=links"
+
+
+rule didnt_grit_snap:
+    input: rules.didnt_network.output, rules.reaches.output, rules.catchments.output
+    output: mapset("didnt_grit_snap"), intermediate_output("didnt_grit_snap/{domain}.gpkg")
+    shell:
+        """
+        grass -c {output[0]} --exec grit_validation.grass.sh didnt_grit_snap links@$(basename {input[0]}) \
+            reaches@$(basename {input[1]}) component_catchments@$(basename {input[2]}) \
+            $(basename {output[0]}) {output[1]}
+        """
+
+rule compare_didnt:
+    input: expand(rules.didnt_grit_snap.output[1], domain=DIDNT_DOMAINS)
+    output: f"output_{GRIT_VERSION}/diagnostics/didnt_comparison.csv"
+    conda: conda_envs.geopandas
+    shell: "grit_validation.py compare_didnt {input} --output={output}"
+
+
+rule plot_didnt_and_bifurcation_validation:
+    input:
+        data=(DATA/"DIDNT_Hariharan_et_al/DIDNT_links.gpkg",
+              rules.compare_didnt.output,
+              "output_v05/segments/GRITv05_random_bifurcations_width_weighted_GLOBAL_EPSG4326.gpkg",
+              "validation/GRITv05_bifurcations_validation_double_checked.csv",
+            ),
+        script=f"figures_{config['version']}/plot_didnt_and_bifurcation_validation.py"
+    output: f"figures_{config['version']}/plot_didnt_and_bifurcation_validation.png"
+    conda: conda_envs.proplot
+    shell:
+        "python {input.script} {input.data} {output}"
+
+
+rule nhd_network:
+    input: DATA/"NHDPlus_v21/GRASS/NHDPlusV21", rules.domain_location.output[0]
+    output: mapset("nhd_network")
+    shell:
+        """
+        grass -c {output} --exec v.proj dbase=$(dirname {input[0]}) location=$(basename {input[0]}) mapset=PERMANENT in=rivers
+        """
+
+
+rule nhd_grit_snap:
+    input: rules.nhd_network.output, rules.reaches.output, rules.catchments.output
+    output: mapset("nhd_grit_snap"), intermediate_output("nhd_grit_snap/{domain}.gpkg")
+    shell:
+        """
+        grass -c {output[0]} --exec grit_validation.grass.sh nhd_grit_snap rivers@$(basename {input[0]}) \
+            reaches@$(basename {input[1]}) component_catchments@$(basename {input[2]}) \
+            $(basename {output[0]}) {output[1]}
+        """
+
+rule compare_nhd:
+    input: expand(rules.nhd_grit_snap.output[1], domain=NHD_DOMAINS)
+    output: "tmp_nhd_compare_done"
+    shell: "touch {output}"
+
+
+ruleorder: select_random_bifurcations > merge_domain_vector 
+rule select_random_bifurcations:
+    input: f"output_{config['version']}/segments/GRIT{config['version']}_segments_simple_{{region}}_EPSG{{epsg}}.gpkg"
+    output: f"output_{config['version']}/segments/GRIT{config['version']}_random_bifurcations_{{region}}_EPSG{{epsg}}.gpkg"
+    conda: conda_envs.geopandas
+    shell: "grit_validation.py select_random_bifurcations {input} --output={output}"
+
+ruleorder: hydrography_coarse_upa > hydrography_compare_grit> export_domain_vector
+rule hydrography_coarse_upa:
+    input: lambda wc: mapset("predictor_darea_mainstem") if wc.hydrography == "grit" \
+                      else ancient(mapset("{hydrography}_raster_upa", lonlat=True))
+    output: intermediate_output("hydrography_comparison/coarse_upa/{hydrography}/{domain}.gpkg")
+    resources:
+        time=60  # mins
+    params:
+        raster=lambda wc: "darea" if wc.hydrography == "grit" else "upa",
+        res=lambda wc: "2000" if wc.hydrography == "grit" else "0:01"
+    shell:
+        """
+        cat <<EOF > /tmp/tmp_hydrography_coarse_up_$$
+        g.region rast={params.raster}@$(basename {input[0]}) -a res={params.res}
+        r.resamp.stats in={params.raster}@$(basename {input[0]}) out=upa method=maximum
+        r.mapcalc exp="upa_gt1000=if(upa>1000, upa, null())"
+        r.to.vect upa_gt1000 out=upa_gt1000 type=point column=upa
+        v.select ain=upa_gt1000 bin=domain out=upa_gt1000_domain
+        v.out.ogr upa_gt1000_domain out={output}
+EOF
+        grass --tmp-mapset $(dirname {input}) --exec bash /tmp/tmp_hydrography_coarse_up_$$
+        rm /tmp/tmp_hydrography_coarse_up_$$
+        """
+
+rule hydrography_compare_grit:
+    input:
+        expand(rules.hydrography_coarse_upa.output, hydrography="grit", domain="{domain}"),
+        rules.hydrography_coarse_upa.output
+    output: intermediate_output("hydrography_comparison/joined/{hydrography}/{domain}.gpkg")
+    resources:
+        time=30  # mins
+    conda: conda_envs.geopandas
+    shell: "validation/hydrography_comparison/script.py {input} {output}"
+
+rule hydrography_compare_all:
+    #input: expand(rules.hydrography_compare_grit.output, domain=DOMAIN_IDS, hydrography="{hydrography}")
+    output: "validation/hydrography_comparison/GRIT_{hydrography}.gpkg"
+    conda: conda_envs.geopandas
+    resources:
+        time=60  # mins
+    shell:
+        """
+        geopandas_utils.py merge_gpkg --index=global_id --preserve-index --src_layer_field_name domain \
+            {output} {input}
+        """
+
+rule hydrography_compare_mapset:
+    input: expand(rules.hydrography_compare_grit.output, hydrography=["hydrosheds", "merit"], domain="{domain}")
+    output: mapset("hydrography_comparison")
+    resources:
+        time=30  # mins
+    shell:
+        """
+        grass -c {output} --exec v.import {input[0]} output=hydrosheds extent=region
+        grass {output} --exec v.import {input[1]} output=merit extent=region
+        """
+
+
+rule plot_hydrography_comparison:
+    input: 
+        expand(rules.hydrography_compare_all.output, hydrography=["hydrosheds", "merit"])#,
+        #expand(rules.hydrography_compare_mapset.output, domain=DOMAIN_IDS)
+    output: "validation/hydrography_comparison/plot_hydrography_comparison.png"
+    resources:
+        time=30  # mins
+    conda: conda_envs.proplot
+    shell: "grit_validation.py plot_hydrography_flow_accumulation {input} {output}"
+

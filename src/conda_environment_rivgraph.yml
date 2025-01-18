@@ -1,0 +1,17 @@
+name: ef-rivgraph
+channels:
+    - conda-forge
+    - jschwenk
+dependencies:
+    - rivgraph
+    - pandas
+    - bioconda::snakemake-minimal
+    - ipython
+    - fire
+    - tqdm  # progress reporting
+    - pip
+    - pip:
+        - ipdb
+        - fastdtw
+        - loguru
+

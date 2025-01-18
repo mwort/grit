@@ -1,0 +1,289 @@
+import os.path as osp
+from pathlib import Path as P
+import numpy as np
+import pandas as pd
+
+from snakemake_utils import conda_envs, ExploreMichelWortmannRemote
+
+from snakemake.remote.SFTP import RemoteProvider
+
+configfile: "GRIT_config.yml"
+
+include: "Snakefile_input_data"
+
+
+GRIT_VERSION = config["version"]
+DIAGNOSTICS = pd.read_csv(config["diagnostics_commands"], comment='#', index_col='name')
+
+# remote download server to upload files to
+MW_SERVER = ExploreMichelWortmannRemote()
+MW_SERVER.prefix = osp.join(MW_SERVER.prefix, "evoflood/GRIT/")
+
+
+def output(path):
+    return osp.join(f"output_{GRIT_VERSION}", path)
+
+def output_vector_file(mapset, vector, region="GLOBAL", epsg=8857, dir=True):
+    nodir = f"{mapset}/GRIT{GRIT_VERSION}_{vector}_{region}_EPSG{epsg}.gpkg"
+    return output(nodir) if dir else nodir
+
+
+def output_vector_files(
+        mapset, *vectors, regions=None, mw_server=config["mw_server_upload"], zenodo=False,
+    ):
+    "All GRIT output files for vector maps."
+    regions = list(DOMAIN_REGIONS) if regions is None else regions
+    flpat = output_vector_file(mapset, "{vect}", "{region}", "{epsg}", dir=False)
+    fls = expand(output(flpat), region=regions, vect=vectors, epsg=config["output_projection_epsg"])
+    if mw_server:
+        fls.extend([MW_SERVER.remote(f) for f in 
+                    expand(flpat+".zip", region=regions, vect=vectors, epsg=config["output_projection_epsg"])])
+    if zenodo and config["zenodo_upload"]:
+        fls.extend(expand(f"zenodo/{flpat}", region=regions, vect=vectors, epsg=config["zenodo_projection_epsg"]))
+    return fls
+
+
+def output_raster(mapset, raster, mw_server=config["mw_server_upload"], zenodo=False):
+    """All raster tiles and a tile index output file.
+    Upload is a dependency of the tile_index.
+    """
+    return output_vector_files(mapset, raster, regions=["tile_index"])
+
+
+rule upload_mw_server:
+    input: output("{mapset}/{file}")
+    output: MW_SERVER.remote("{mapset}/{file}.zip")
+    resources:
+        time=180
+    shell: "zip -j {output} {input}"
+
+
+rule upload_zenodo:
+    input: output("{mapset}/{file}")
+    output: "zenodo/{mapset}/{file}"
+    shell:
+        """
+        zip -j {input}.zip {input}  # -j removes the paths in the zip
+        curl --progress-bar --upload-file {input}.zip \
+            "{config[zenodo_bucket_url]}/$(basename {input}).zip?access_token={config[zenodo_token]}" > {output}
+        rm {input}.zip
+        """
+
+
+rule diagnostics_domain:
+    input: mapset("{mapset}")
+    output: intermediate_output("diagnostics/{mapset}/{file}/{domain}.csv")
+    resources:
+        time=10
+    params:
+        cmd=lambda wc: DIAGNOSTICS['cmd'][wc.file]
+    shell:
+        """
+        tmpms={wildcards.mapset}_$$
+        grass -c GRASS/{wildcards.domain}/$tmpms --exec g.mapsets mapset={wildcards.mapset}
+        grass GRASS/{wildcards.domain}/$tmpms --exec {params.cmd} > {output}
+        rm -rf GRASS/{wildcards.domain}/$tmpms
+        """
+
+
+rule diagnostics_merge:
+    input:
+        lambda wc: [intermediate_output(f"diagnostics/{DIAGNOSTICS['mapset'][wc.file]}/{wc.file}/{d}.csv")
+                    for d in DOMAIN_IDS]
+    output: output("diagnostics/{file}.{ext}")
+    run:
+        from tqdm import tqdm
+        try:
+            dat = [pd.read_csv(f, index_col=False) for f in tqdm(input)]
+        except pd.errors.ParserError:
+            dat = [pd.read_csv(f, index_col=False, delimiter="|") for f in tqdm(input, "Trying with | delimiter")]
+        ids = [osp.splitext(osp.basename(f))[0] for i, f in enumerate(input) if len(dat[i])]
+        index_col = dat[0].columns[0]  # workaround for read_csv(..., index_col) bug
+        dat = pd.concat([d.set_index(index_col) for d in dat if len(d)], keys=ids, names=["domain_id", index_col])
+        rc = DOMAINS_TBL.loc[dat.reset_index()["domain_id"], "region_code"]
+        dat.insert(0, "region_code", rc.values)
+        getattr(dat, "to_"+wildcards.ext)(output[0])
+
+
+rule total_drainage_share:
+    input: rules.segments.output[0], rules.catchments.output[0], rules.domain_location.output[0]
+    output: intermediate_output("diagnostics/PERMANENT/total_drainage_share/{domain}.csv")
+    shell:
+        """
+        echo share > {output}
+        grass --tmp-mapset $(dirname {input[0]}) --exec river_network_utils.py check_domain_drainage_share \
+            segments@$(basename {input[0]}) component_catchments@$(basename {input[1]}) \
+            domain@$(basename {input[2]}) >> {output}
+        """
+
+ruleorder: total_drainage_share > diagnostics_domain
+
+
+rule log_analysis:
+    input: directory("log_archive")
+    output: "log_analysis.csv"
+    run:
+        import datetime as dt
+        from glob import glob
+        def logfile_runtime(file):
+            with open(file) as f:
+                logf = f.read()
+            dts=re.findall(r"\n\[(.+)\]", logf)
+            if len(dts) == 2:
+                return dt.datetime.strptime(dts[1], "%c") - dt.datetime.strptime(dts[0], "%c")
+
+        def logfile_cpus(file):
+            with open(file) as f:
+                logf = f.read()
+            dts=re.findall(r"\nProvided cores: ([0-9]*)", logf)
+            if len(dts) == 1:
+                return int(dts[0])
+
+        logfiles = sorted(glob(input[0]+"/*.log"))
+        df = pd.DataFrame([re.match("(.+)_domain=(\w{4})", osp.basename(s)).groups() for s in logfiles],
+                        columns=["rule", "domain"])
+        df["runtime"] = [logfile_runtime(f) for f in logfiles]
+        df["cpus"] = [logfile_cpus(f) for f in logfiles]
+        df["cpu_hrs"] = (df.runtime * df.cpus).dt.total_seconds() / (60**2)
+        df.to_csv(output[0])
+
+
+def output_layer(wc):
+    """Decide what to use as layer in gpkg output."""
+    try:
+        layer = int(wc.layer)
+    except ValueError:
+        # if not int use original layer name
+        return wc.layer
+    if wc.vector in config["line_node_vectors"]:
+        return {1: "lines", 2: "nodes"}.get(layer)
+    # default
+    return f"{wc.vector}__{wc.layer}"
+
+rule export_domain_vector:
+    input: mapset("{mapset}")
+    output: intermediate_output("{mapset}/{vector}/{layer}/{domain}.gpkg")
+    resources:
+        time=240
+    params:
+        out_layer=output_layer,
+        multi_features=lambda wc: "-m" if wc.mapset == "catchments" else ""
+    shell:
+        """
+        grass $(dirname {input}) --tmp-mapset --exec v.out.ogr {params.multi_features} input={wildcards.vector}@{wildcards.mapset} \
+            layer={wildcards.layer} output_layer={params.out_layer} output={output}
+        """
+
+
+def select_domains(wc):
+    wckw = dict(
+        layer=[1, 2] if wc.vector in config["line_node_vectors"] else [1],
+        domain=DOMAIN_IDS if wc.region == "GLOBAL" else DOMAIN_REGIONS[wc.region],
+    )
+    return expand(intermediate_output("{{mapset}}/{{vector}}/{layer}/{domain}.gpkg"), **wckw)
+
+rule merge_domain_vector:
+    input: select_domains
+    output:
+        output_vector_file("{mapset}", "{vector}", "{region,GLOBAL|%s}" % ('|'.join(DOMAIN_REGIONS.keys())), "{epsg}")
+    resources:
+        time=120
+    threads: lambda wc: 16 if wc.vector in ["reach_catchments", "segment_catchments"] else 4
+    conda: conda_envs.geopandas
+    shell:
+        """
+        geopandas_utils.py merge_gpkg --index=global_id --preserve-index --src_layer_field_name domain \
+            --crs=EPSG:{wildcards.epsg} {output} {input}
+        """
+
+
+rule raster_output_grid:
+    input: rules.domain_location.output[0]
+    output:
+        mapset("raster_output_grid"),
+        intermediate_output("raster_output_grid/{domain}.csv")
+    resources:
+        time=30
+    shell:
+        "grass -c {output[0]} --exec mfp_river_network.grass.sh raster_output_grid domain@PERMANENT $(basename {output[0]}) {output[1]}"
+
+
+raster_output_grid_file = intermediate_output("raster_output_grid.csv")
+
+checkpoint raster_output_grid_sparse:
+    input: expand(rules.raster_output_grid.output[1], domain=DOMAIN_IDS)
+    output: raster_output_grid_file
+    run:
+        dat = pd.concat([pd.read_csv(f) for f in input],
+            names=["domain", "id"],
+            keys=[osp.splitext(osp.basename(f))[0] for f in input]).reset_index()
+        dat["tile_id"] = dat["west"] + '__' + dat["south"]
+        dat[["tile_id", "domain"]].sort_values("tile_id").to_csv(output[0], index=False)
+
+
+rule raster_output_domain_tile:
+    input:
+        mapset("{mapset}"),
+        rules.raster_output_grid.output[0]
+    output:
+        temp(intermediate_output("{mapset}/{raster}/{x}__{y}__{domain}.tif")),
+        temp(mapset("{mapset}__{raster}__{x}__{y}"))
+    resources:
+        time=10
+    shell:
+        """
+        reg=$(grass -c {output[1]} --exec v.db.select map=grid@$(basename {input[1]}) where="south='{wildcards.y}' AND west='{wildcards.x}'" -r)
+        grass {output[1]} --exec g.region $reg
+        grass {output[1]} --exec r.out.gdal -cmf input={wildcards.raster}@$(basename {input[0]}) output={output[0]} \
+            type=Float32 createopt="COMPRESS=DEFLATE"
+        """
+
+
+def raster_patch_tiles(wc):
+    outpath = rules.raster_output_domain_tile.output[0]
+    if osp.exists(raster_output_grid_file):
+        tiles = pd.read_csv(raster_output_grid_file)
+        doms = tiles.loc[tiles.tile_id == wc.tile_id, "domain"]
+        kw = dict(zip("xy", wc.tile_id.split("__")))
+        kw.update({"raster": wc.raster, "mapset": wc.mapset})
+        return expand(outpath, domain=doms, **kw)
+    else:
+        return raster_output_grid_file
+
+rule raster_output_patch_tile:
+    input: raster_patch_tiles
+    output: output(f"{{mapset}}/{{raster}}/GRIT{GRIT_VERSION}_{{raster}}__{{tile_id}}.tif")
+    conda: conda_envs.geopandas
+    resources:
+        time=10
+    params:
+        method=lambda wc: config["raster_output_patch_tile_method"][wc.mapset][wc.raster]
+    shell:
+        """
+        if (( $(echo {input} | wc -w) > 1 )); then
+            gdal_calc.py -A {input} --outfile={output} --co="COMPRESS=DEFLATE" --extent=union --overwrite \
+                --calc="numpy.{params.method}(A, axis=0)"
+        else
+            cp {input} {output}
+        fi
+        """
+
+
+def raster_tiles(wc):
+    outpath = rules.raster_output_patch_tile.output[0]
+    kw = {k: getattr(wc, k) for k in ["mapset", "raster"]}
+    if osp.exists(raster_output_grid_file):
+        tiles = pd.read_csv(raster_output_grid_file)
+        fls = [outpath.format(tile_id=i, **kw) for i in tiles.tile_id.unique()]
+        if config["mw_server_upload"]:
+           relpaths = [osp.relpath(f, output(".")) for f in fls]
+           fls.extend([MW_SERVER.remote(f)+".zip" for f in relpaths])
+        return fls
+    else:
+        return raster_output_grid_file
+
+checkpoint raster_tile_index:
+    input: raster_tiles
+    output: output_vector_file("{mapset}", "{raster}", "tile_index", "{epsg}")
+    shell:
+        "gdaltindex -t_srs EPSG:{wildcards.epsg} {output} {input}"

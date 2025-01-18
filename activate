@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+
+# this file should be placed into the project root directory
+export PROJECT_ROOT="$(realpath $( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd ))"
+
+# cluster environment
+
+# GRASS CONFIG
+module load \
+    zlib/1.2.11-GCCcore-10.2.0 \
+    zstd/1.4.5-GCCcore-10.2.0 \
+    bzip2/1.0.8-GCCcore-10.2.0 \
+    PROJ/7.2.1-GCCcore-10.2.0 \
+    GDAL/3.2.1-fosscuda-2020b \
+    cairo/1.16.0-GCCcore-10.2.0 \
+    GEOS/3.9.1-GCC-10.2.0 \
+    netCDF/4.7.4-iimpi-2020b
+module unload Python/3.8.6-GCCcore-10.2.0 SciPy-bundle/2020.11-fosscuda-2020b
+module -q load OpenSSL/1.1.1h-GCCcore-10.2.0
+# for parallel session management, we use process ID (PID) as lock file number:
+export GIS_LOCK=$$
+# skip mapset owner check
+export GRASS_SKIP_MAPSET_OWNER_CHECK="nonempty"
+
+# activate conda environment
+module load Anaconda3
+source activate $PROJECT_ROOT/bin/conda/ef-base
+
+# source files on path for script execution/import
+srcdir=$PROJECT_ROOT/src
+bindir=$PROJECT_ROOT/bin/bin
+export PATH="$srcdir:$bindir:$PATH"
+export PYTHONPATH="$srcdir:$PYTHONPATH"
+export RPYPATH=$srcdir
+
+# snakemake configuration
+export SNAKEMAKE_CONDA_PREFIX=$PROJECT_ROOT/bin/conda
+# for use in snakemake_utils
+export SNAKEMAKE_CONDA_ENVFILES=$PROJECT_ROOT'/src/conda_environment_*.yml'
+# $SNAKEMAKE_PROFILE
+
+# snakemake interactive shortcut
+alias sm='snakemake --use-conda -j ${SLURM_CPUS_PER_TASK:-1}'

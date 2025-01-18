@@ -1,0 +1,33 @@
+import os.path as osp
+
+
+rule all:
+    input: lambda wc: [osp.splitext(f.strip())[0] for f in open("filelist.txt").readlines()]
+    output: directory("FABDEM_V1-0")
+    shell: "mv *-*_{output}/*.tif {output}"
+
+
+rule mosaic:
+    input: rules.all.output
+    output: "fabdem_v1-0.vrt"
+    shell: "gdalbuildvrt {output} FABDEM_V1-0/*.tif"
+
+rule tiles:
+    input: "FABDEM_tiles.geojson"
+    output: directory("GRASS/lonlat/tiles")
+    shell: "grass -c {output} v.in.ogr in={input} out=fabdem_tiles"
+
+
+rule download_unpack:
+    output: temp(directory("{ul}-{lr}_FABDEM_{v}"))
+    shell:
+        "wget https://data.bris.ac.uk/webshare/Inundation_modelling/90118eab-3a6d-4fdc-92e2-d9c58be8dafe/FABDEM/{output}.zip ;"
+        "mkdir -p {output};"
+        "unzip -d {output} {output}.zip;"
+        "rm {output}.zip"
+
+
+rule grass:
+    input: rules.mosaic.output
+    output: directory('GRASS/lonlat/PERMANENT')
+    shell: 'grass -c {input} $(dirname {output}) --exec r.external {input} out=fabdem -r'

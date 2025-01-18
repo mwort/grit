@@ -1,0 +1,377 @@
+<h1>Global River Topology (GRIT)</h1>
+
+<p>Authors: Michel Wortmann, Louise Slater, Laurence Hawker, Yinxue Liu, Jeffrey Neal</p>
+
+<p>Licensed under <a href="https://creativecommons.org/licenses/by-nc/4.0/legalcode">CC BY-NC 4.0</a></p>
+
+<p>The Global River Topology (GRIT) is a vector-based, global river network that not only represents the tributary components of the
+global drainage network but also the distributary ones, including multi-thread rivers, canals and delta distributaries.
+It is also the first global hydrography (excl. Antarctica and Greenland) produced at 30m raster resolution.
+It is created by merging Landsat-based river mask (GRWL) with elevation-generated streams to ensure a homogeneous drainage density outside
+of the river mask (rivers narrower than approx. 30m). Crucially, it uses a new 30m digital terrain model (FABDEM, based on TanDEM-X)
+that shows greater accuracy over the traditionally used SRTM derivatives. After vectorisation and pruning, directionality is assigned by a
+combination of elevation, flow angle, heuristic and continuity approaches (based on RivGraph). The network topology (lines and nodes, upstream/downstream IDs)
+is available as layers and attribute information in the GeoPackage files (readable by QGIS/ArcMap/GDAL).</p>
+
+<p><strong>Regions</strong></p>
+
+<p>Vector files are provided in 6 continental regions with the following codes:</p>
+
+<ul>
+	<li>AF - Africa</li>
+	<li>AS - Asia</li>
+	<li>EU - Europe</li>
+	<li>NA - North America</li>
+	<li>SA - South America</li>
+	<li>SP - South Pacific/Australia</li>
+</ul>
+
+<p>The domain polygons (GRITv04_domain_GLOBAL.gpkg.zip) provide 60 subcontinental catchment groups that are available as vector attributes.
+They allow for more fine-grained subsetting of data (e.g. with ogr2ogr --where).</p>
+
+<p><strong>Network segments</strong></p>
+
+<p>Lines between inlet, outlet, confluence and bifurcation nodes. Files have lines and nodes layers.</p>
+
+<p><em><strong>Attribute description of lines layer</em></strong></p>
+
+<table>
+	<thead>
+		<tr>
+			<th scope="col">Name</th>
+			<th scope="col">Data type</th>
+			<th scope="col">Description</th>
+		</tr>
+	</thead>
+	<tbody>
+		<tr>
+			<td>cat</td>
+			<td>integer</td>
+			<td>domain internal feature ID</td>
+		</tr>
+		<tr>
+			<td>global_id</td>
+			<td>integer</td>
+			<td>global river segment ID, same as FID</td>
+		</tr>
+		<tr>
+			<td>catchment_id</td>
+			<td>integer</td>
+			<td>global catchment ID</td>
+		</tr>
+		<tr>
+			<td>upstream_node_id</td>
+			<td>integer</td>
+			<td>global segment node ID at upstream end of line</td>
+		</tr>
+		<tr>
+			<td>downstream_node_id</td>
+			<td>integer</td>
+			<td>global segment node ID at downstream end of line</td>
+		</tr>
+		<tr>
+			<td>upstream_line_ids</td>
+			<td>text</td>
+			<td>comma-separated list of global river segment IDs connecting at upstream end of line</td>
+		</tr>
+		<tr>
+			<td>downstream_line_ids</td>
+			<td>text</td>
+			<td>comma-separated list of global river segment IDs connecting at downstream end of line</td>
+		</tr>
+		<tr>
+			<td>direction_algorithm</td>
+			<td>float</td>
+			<td>code of RivGraph method used to set the direction of line</td>
+		</tr>
+		<tr>
+			<td>width_adjusted</td>
+			<td>float</td>
+			<td>median river width in m without accounting for width of segments connecting upstream/downstream</td>
+		</tr>
+		<tr>
+			<td>length_adjusted</td>
+			<td>float</td>
+			<td>segment length in m without accounting for width of segments connecting upstream/downstream in m</td>
+		</tr>
+		<tr>
+			<td>is_mainstem</td>
+			<td>integer</td>
+			<td>1 if widest segment of bifurcated flow or no bifurcation upstream, otherwise 0</td>
+		</tr>
+		<tr>
+			<td>cycle</td>
+			<td>integer</td>
+			<td>&gt;0 if segment is part of an unresolved cycle, 0 otherwise</td>
+		</tr>
+		<tr>
+			<td>length</td>
+			<td>float</td>
+			<td>segment length in m</td>
+		</tr>
+		<tr>
+			<td>azimuth</td>
+			<td>float</td>
+			<td>direction of line connecting upstream-downstream nodes in degrees from North</td>
+		</tr>
+		<tr>
+			<td>sinuousity</td>
+			<td>float</td>
+			<td>ratio of Euclidean distance between upstream-downstream nodes and line length, i.e. 1 meaning a perfectly straight line</td>
+		</tr>
+		<tr>
+			<td>domain</td>
+			<td>text</td>
+			<td>catchment group ID, see domain index file</td>
+		</tr>
+	</tbody>
+</table>
+
+<p><em><strong>Attribute description of nodes layer</strong></em></p>
+
+<table>
+	<thead>
+		<tr>
+			<th scope="col">Name</th>
+			<th scope="col">Data type</th>
+			<th scope="col">Description</th>
+		</tr>
+	</thead>
+	<tbody>
+		<tr>
+			<td>cat</td>
+			<td>integer</td>
+			<td>domain internal feature ID</td>
+		</tr>
+		<tr>
+			<td>global_id</td>
+			<td>integer</td>
+			<td>global river node ID, same as FID</td>
+		</tr>
+		<tr>
+			<td>catchment_id</td>
+			<td>integer</td>
+			<td>global catchment ID</td>
+		</tr>
+		<tr>
+			<td>upstream_line_ids</td>
+			<td>text</td>
+			<td>comma-separated list of global river segment IDs flowing into node</td>
+		</tr>
+		<tr>
+			<td>downstream_line_ids</td>
+			<td>text</td>
+			<td>comma-separated list of global river segment IDs flowing out of node</td>
+		</tr>
+		<tr>
+			<td>node_type</td>
+			<td>text</td>
+			<td>description of node, one of bifurcation, confluence, inlet, coastal_outlet, sink_outlet, grwl_change</td>
+		</tr>
+		<tr>
+			<td>grwl_value</td>
+			<td>integer</td>
+			<td>GRWL code at node</td>
+		</tr>
+		<tr>
+			<td>grwl_transition</td>
+			<td>text</td>
+			<td>GRWL codes of change at grwl_change nodes</td>
+		</tr>
+		<tr>
+			<td>cycle</td>
+			<td>integer</td>
+			<td>&gt;0 if segment is part of an unresolved cycle, 0 otherwise</td>
+		</tr>
+		<tr>
+			<td>continuity_violated</td>
+			<td>integer</td>
+			<td>1 if flow continuity is violated, otherwise 0</td>
+		</tr>
+		<tr>
+			<td>domain</td>
+			<td>text</td>
+			<td>catchment group, see domain index file</td>
+		</tr>
+	</tbody>
+</table>
+
+<p>&nbsp;</p>
+
+<p><strong>Network reaches</strong></p>
+
+<p>Segment lines split to not exceed 1km in length, i.e. these lines will be shorter than 1km and longer than 500m unless the segment is shorter. A simplified version with no vertices between nodes is also provided. Files have lines and nodes layers.</p>
+
+<p><em><strong>Attribute description of lines layer</em></strong></p>
+
+<table>
+	<thead>
+		<tr>
+			<th scope="col">Name</th>
+			<th scope="col">Data type</th>
+			<th scope="col">Description</th>
+		</tr>
+	</thead>
+	<tbody>
+		<tr>
+			<td>cat</td>
+			<td>integer</td>
+			<td>domain internal feature ID</td>
+		</tr>
+		<tr>
+			<td>segment_id</td>
+			<td>integer</td>
+			<td>global segment ID of reach</td>
+		</tr>
+		<tr>
+			<td>global_id</td>
+			<td>integer</td>
+			<td>global river reach ID, same as FID</td>
+		</tr>
+		<tr>
+			<td>catchment_id</td>
+			<td>integer</td>
+			<td>global catchment ID</td>
+		</tr>
+		<tr>
+			<td>upstream_node_id</td>
+			<td>integer</td>
+			<td>global reach node ID at upstream end of line</td>
+		</tr>
+		<tr>
+			<td>downstream_node_id</td>
+			<td>integer</td>
+			<td>global reach node ID at downstream end of line</td>
+		</tr>
+		<tr>
+			<td>upstream_line_ids</td>
+			<td>text</td>
+			<td>comma-separated list of global river reach IDs connecting at upstream end of line</td>
+		</tr>
+		<tr>
+			<td>downstream_line_ids</td>
+			<td>text</td>
+			<td>comma-separated list of global river reach IDs connecting at downstream end of line</td>
+		</tr>
+		<tr>
+			<td>length</td>
+			<td>float</td>
+			<td>length of reach in m</td>
+		</tr>
+		<tr>
+			<td>sinuousity</td>
+			<td>float</td>
+			<td>ratio of eucledian distance betwen upstream-downstream nodes and line length, i.e. 1 meaning a perfectly straight line</td>
+		</tr>
+		<tr>
+			<td>azimuth</td>
+			<td>float</td>
+			<td>direction of line connecting upstream-downstream nodes in degrees from North</td>
+		</tr>
+		<tr>
+			<td>domain</td>
+			<td>text</td>
+			<td>catchment group, see domain index file</td>
+		</tr>
+	</tbody>
+</table>
+
+<p><em><strong>Attribute description of nodes layer</strong></em></p>
+
+<table>
+	<thead>
+		<tr>
+			<th scope="col">Name</th>
+			<th scope="col">Data type</th>
+			<th scope="col">Description</th>
+		</tr>
+	</thead>
+	<tbody>
+		<tr>
+			<td>cat</td>
+			<td>integer</td>
+			<td>domain internal feature ID</td>
+		</tr>
+		<tr>
+			<td>segment_node_id</td>
+			<td>integer</td>
+			<td>global ID of segment node at segment intersections, otherwise blank</td>
+		</tr>
+		<tr>
+			<td>n_segments</td>
+			<td>integer</td>
+			<td>number of segments attached to node</td>
+		</tr>
+		<tr>
+			<td>global_id</td>
+			<td>integer</td>
+			<td>global river reach node ID, same as FID</td>
+		</tr>
+		<tr>
+			<td>upstream_line_ids</td>
+			<td>text</td>
+			<td>comma-separated list of global river reach IDs flowing into node</td>
+		</tr>
+		<tr>
+			<td>downstream_line_ids</td>
+			<td>text</td>
+			<td>comma-separated list of global river reach IDs flowing out of node</td>
+		</tr>
+		<tr>
+			<td>domain</td>
+			<td>text</td>
+			<td>catchment group, see domain index file</td>
+		</tr>
+	</tbody>
+</table>
+
+<p>&nbsp;</p>
+
+<p><strong>Catchments</strong></p>
+
+<p>Catchment outlines for entire river basins (network components, including coastal drainage areas), segments (aka. subbasins) and reaches.</p>
+
+<p><em><strong>Attribute description</strong></em></p>
+
+<table>
+	<thead>
+		<tr>
+			<th scope="col">Name</th>
+			<th scope="col">Data type</th>
+			<th scope="col">Description</th>
+		</tr>
+	</thead>
+	<tbody>
+		<tr>
+			<td>cat</td>
+			<td>integer</td>
+			<td>domain internal feature ID</td>
+		</tr>
+		<tr>
+			<td>global_id</td>
+			<td>integer</td>
+			<td>global catchment ID, same as global_id of segment/reach ID if is_coastal == 0 for respective catchments or the catchment_id for component_catchments, same as FID</td>
+		</tr>
+		<tr>
+			<td>area</td>
+			<td>float</td>
+			<td>catchment area in km2</td>
+		</tr>
+		<tr>
+			<td>is_coastal</td>
+			<td>integer</td>
+			<td>1 for coastal drainage areas, 0 otherwise</td>
+		</tr>
+		<tr>
+			<td>domain</td>
+			<td>text</td>
+			<td>catchment group, see domain index file</td>
+		</tr>
+	</tbody>
+</table>
+
+<p>&nbsp;</p>
+
+<p><strong>Raster </strong></p>
+
+<p>Upstream drainage area, flow direction and other raster-based products are also available upon request.</p>

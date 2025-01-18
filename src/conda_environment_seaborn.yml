@@ -1,0 +1,16 @@
+name: ef-seaborn
+channels:
+    - conda-forge
+dependencies:
+    - pandas
+    - proplot
+    - seaborn
+    - cartopy
+    - geopandas
+    - ipython
+    - fire
+    - tqdm  # progress reporting
+    - pip
+    - pip:
+        - ipdb
+

@@ -1,0 +1,13 @@
+--neighbour_buffer=10e3
+--neighbour_buffer=50e3
+--neighbour_buffer=100e3
+--neighbour_buffer=200e3
+--neighbour_buffer=300e3
+--objective=non_overlapping_ratio
+--objective=compactness
+--objective=area_ratio
+--objective=area_deficit
+"--objective=['compactness_change','area_ratio']"
+"--objective=['compactness_change','area_deficit']"
+"--objective=['compactness_change','non_overlapping_ratio']"
+"--objective=['compactness_change','non_overlapping_ratio','area_deficit']"
