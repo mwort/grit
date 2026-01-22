@@ -1,6 +1,5 @@
 exactextract==0.3.0
 geopandas==1.1.2
 rasterio==1.5.0
-networkx==3.6.1
 tqdm==4.67.1
 folium==0.20.0
